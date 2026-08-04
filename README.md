@@ -1,142 +1,118 @@
-# Conduit — SaaS Integration Gateway
+# Fleet
 
-Conduit is a lightweight, dynamic SaaS integration gateway framework built in Go. It enables developers to build, distribute, configure, and monitor connector instances for popular external services (such as GitHub, Slack, and Stripe) through a single unified interface.
+**Multi-Tenant Model Serving Gateway**
 
-Conduit handles the heavy lifting of:
-- **Authentication**: Managing API keys and standardizing OAuth 2.0 redirection & token refresh flows.
-- **Secure Storage**: Keeping configuration credentials encrypted at rest in a local SQLite database (using AES-GCM encryption).
-- **Drift Detection**: Running a periodic schema drift detector worker that proactively checks for shifts in API shapes or payload field types.
-- **Observability**: Exposing real-time gateway performance metrics, OAuth token refreshes, and endpoint error rates via Prometheus.
-- **Auto-generated API Docs**: Dynamically generating and serving an OpenAPI 3.x specification and hosting an interactive Swagger UI API explorer.
+Fleet is a model-serving gateway that routes inference traffic across multiple tenants and models, using real-time stream processing to drive canary promote/rollback decisions and scheduled drift detection to catch longer-term model degradation — all while enforcing per-tenant rate limits and cost attribution.
 
----
+Fleet extends the credential-security and API-client patterns from [Conduit](#) (a Go SDK for third-party integrations) into a live, multi-tenant serving system.
 
-## 🏗 Project Architecture
+## Features
 
-The diagram below illustrates how the components of Conduit communicate:
+- **Tenant-aware routing** — requests are authenticated and routed to the correct model version per tenant.
+- **Real-time canary safety** — request/response events stream through Kafka into a PyFlink job that computes rolling per-tenant/per-model error rate and latency windows, served via Feast to drive automatic canary promote/rollback.
+- **Scheduled drift detection** — a nightly Airflow DAG runs Evidently AI drift checks per tenant-model pair and flags degrading pairs.
+- **Rate limiting** — Redis-backed per-tenant request throttling to prevent noisy-neighbor effects.
+- **Cost attribution** — per-request cost logging to PostgreSQL for per-tenant chargeback and capacity planning.
+- **Model packaging & tracking** — models are served via BentoML and versioned/tracked via MLflow.
+
+## Architecture
 
 ```mermaid
-graph TD
-    %% Styling
-    classDef default fill:#FFFFFF,stroke:#DFE1E6,stroke-width:1px,color:#091E42;
-    classDef highlight fill:#DEEBFF,stroke:#0052CC,stroke-width:2px,color:#0052CC;
-    classDef worker fill:#E3FCEF,stroke:#36B37E,stroke-width:1px,color:#006644;
-    classDef mock fill:#FFF0B3,stroke:#FFAB00,stroke-width:1px,color:#825F01;
+flowchart TD
+    Client([Client]) --> Gateway["Fleet Gateway (Go)"]
+    Gateway --> ModelServer["Model Server (BentoML)"]
+    ModelServer --> Gateway
 
-    %% Components
-    UI["Dashboard UI (HTML, CSS, JS)"]:::highlight
-    GW["API Gateway (Go Server, :8080)"]:::highlight
-    DB[("SQLite Database<br>(conduit.db)")]
-    DD["Drift Detector<br>(Background Worker)"]:::worker
-    PROM["Prometheus Metrics<br>(/metrics)"]
-    SWAG["Swagger UI Docs<br>(/docs)"]
-    
-    subgraph "Connectors (Go SDK)"
-        SlackConn["Slack Connector"]
-        GithubConn["GitHub Connector"]
-        StripeConn["Stripe Connector"]
-    end
-    
-    MockServer["Mock SaaS Server (:8081)"]:::mock
+    Gateway -->|"request/response events"| Kafka[("Apache Kafka")]
+    Kafka --> Flink["PyFlink Job\n(rolling error/latency windows)"]
+    Flink --> Feast[("Feast\nOnline Store")]
+    Feast -->|"canary promote/rollback decision"| Gateway
 
-    %% Relationships
-    UI -->|Admin Actions & Executions| GW
-    GW -->|Stores configuration & encrypted credentials| DB
-    GW -->|Hosts| SWAG
-    GW -->|Exposes| PROM
-    DD -->|Polls current schemas for drift| DB
-    DD -->|Scans active instances| GithubConn
-    DD -->|Scans active instances| SlackConn
-    DD -->|Scans active instances| StripeConn
+    Gateway -->|"per-tenant limits"| Redis[("Redis\nRate Limiting")]
+    Gateway -->|"per-request cost"| Postgres[("PostgreSQL\nCost Attribution")]
 
-    GithubConn -.->|HTTP Requests| MockServer
-    SlackConn -.->|HTTP Requests| MockServer
-    StripeConn -.->|HTTP Requests| MockServer
-    MockServer -->|Simulated Webhooks| GW
+    Airflow["Airflow\n(nightly DAG)"] --> Evidently["Evidently AI\nDrift Detection"]
+    Evidently -->|"flags degrading\ntenant-model pairs"| Gateway
+
+    MLflow[("MLflow\nModel Registry")] -.->|"tracks versions"| ModelServer
+
+    classDef gateway fill:#2563eb,stroke:#1e3a8a,color:#fff
+    classDef stream fill:#7c3aed,stroke:#4c1d95,color:#fff
+    classDef store fill:#059669,stroke:#065f46,color:#fff
+    classDef batch fill:#d97706,stroke:#92400e,color:#fff
+
+    class Gateway gateway
+    class Kafka,Flink stream
+    class Feast,Redis,Postgres,MLflow store
+    class Airflow,Evidently batch
 ```
 
-### Component Roles
+See [ORD.md](./ORD.md) for the full operational requirements document.
 
-1. **Dashboard UI**: A Single Page Application (SPA) located in `/ui/` styled according to the Atlassian Design Guidelines. It lets developers explore registered connectors, perform OAuth installations, trigger API endpoint executions manually, and monitor system drift logs.
-2. **API Gateway (`gateway` package)**: The core server engine. It sets up HTTP routing, processes installations, decrypts credentials, invokes connectors, handles OAuth callbacks, and dispatches incoming webhook payloads.
-3. **Connectors (`connectors` package)**: Modules implementing the `sdk.Connector` interface. They describe configuration requirements, request scopes, available API endpoints, and input/output payload schemas.
-4. **Drift Detector**: A background worker thread running every 30 seconds that checks whether the shape of data in the connected third-party APIs has drifted from what was captured during initial configuration.
-5. **Mock Server (`mock` package)**: A local mock SaaS provider. It simplifies local development by simulating OAuth credential exchanges, mock API endpoints (e.g., creating GitHub issues), and periodic webhook payloads.
+## Tech Stack
 
----
+| Layer | Technology |
+|---|---|
+| Gateway / routing | Go |
+| Streaming | Apache Kafka |
+| Stream processing | PyFlink |
+| Feature/online store | Feast |
+| Rate limiting | Redis |
+| Cost attribution | PostgreSQL |
+| Model tracking | MLflow |
+| Model serving | BentoML |
+| Scheduling | Airflow |
+| Drift detection | Evidently AI |
+| Deployment | Docker, Kubernetes |
 
-## 📁 Repository Layout
+## Project Structure
 
-```text
-conduit-go/
-├── cmd/
-│   ├── conduit-scaffold/ # Code generator tool creating Go connector skeletons from OpenAPI specs
-│   └── gateway/          # Main entrypoint running the Conduit API Gateway & Mock Provider
-├── connectors/           # Connector implementations
-│   ├── github/           # GitHub integration logic
-│   ├── slack/            # Slack integration logic
-│   └── stripe/           # Stripe integration logic
-├── gateway/              # Gateway logic (DB integration, router, drift detector, openapi generation)
-├── mock/                 # Built-in Mock SaaS server providing mock endpoints & webhook dispatchers
-├── sdk/                  # Conduit SDK defining interfaces, structs, and credentials models
-└── ui/                   # Frontend SPA files (index.html, app.css, app.js)
+```
+fleet/
+├── gateway/          # Go gateway service (routing, rate limiting, cost attribution)
+│   ├── cmd/
+│   ├── internal/
+│   │   ├── router/
+│   │   ├── ratelimit/
+│   │   ├── cost/
+│   │   └── kafka/
+│   └── go.mod
+├── streaming/         # PyFlink job for rolling error/latency windows
+│   └── rolling_metrics_job.py
+├── drift/             # Evidently AI drift detection scripts
+│   └── drift_check.py
+├── dags/              # Airflow DAGs
+│   └── nightly_drift_dag.py
+├── models/            # BentoML service definitions
+├── deploy/            # Kubernetes manifests, Dockerfiles
+├── ORD.md
+└── README.md
 ```
 
----
-
-## ⚡ Getting Started
+## Getting Started
 
 ### Prerequisites
 
-Ensure you have **Go 1.21+** installed.
+- Go 1.22+
+- Python 3.10+
+- Docker & Kubernetes (kind/minikube for local dev)
+- Kafka, Redis, PostgreSQL (see `deploy/docker-compose.yml`)
 
-### 1. Run the API Gateway and Mock Server
-
-Start the integrated gateway and mock SaaS provider with the following command:
-
-```bash
-go run cmd/gateway/main.go
-```
-
-By default, the server will output startup logs:
-- **Dashboard UI**: [http://localhost:8080/ui/](http://localhost:8080/ui/)
-- **Interactive OpenAPI Documentation**: [http://localhost:8080/docs](http://localhost:8080/docs)
-- **Raw OpenAPI Spec**: [http://localhost:8080/openapi.json](http://localhost:8080/openapi.json)
-- **Prometheus Metrics**: [http://localhost:8080/metrics](http://localhost:8080/metrics)
-- **Mock SaaS Server**: Running on `localhost:8081`
-
-### 2. Configure Encryption Key (Production)
-
-Conduit automatically encrypts OAuth tokens and API keys using AES-256-GCM. During local development, it falls back to a default key. For production, set the environment variable:
+### Local Setup
 
 ```bash
-export CONDUIT_ENCRYPTION_KEY="your-32-byte-long-secret-key-here"
+# Clone the repo
+git clone <repo-url> && cd fleet
+
+# Start infra dependencies
+docker compose -f deploy/docker-compose.yml up -d
+
+# Run the gateway
+cd gateway && go run cmd/main.go
+
+# Run the PyFlink job
+cd streaming && python rolling_metrics_job.py
+
+# Deploy Airflow DAGs
+cp dags/*.py $AIRFLOW_HOME/dags/
 ```
-
----
-
-## 🛠 Command Line Flags
-
-You can customize the execution of the main binary:
-
-- `-addr`: Port and IP interface for the Gateway (default `:8080`).
-- `-db`: Path to the SQLite database file (default `./conduit.db`).
-- `-mock`: Set to `true` (default) to start the built-in mock SaaS server, or `false` to attempt connection to real SaaS APIs.
-- `-mock-addr`: Address for the mock server to bind to (default `:8081`).
-- `-webhook-secret`: Secret key used for signing and verifying incoming webhook signatures.
-
----
-
-## 🧩 Developing Custom Connectors
-
-To create a new integration, you can use the built-in scaffolding CLI tool.
-
-### Using the Scaffold CLI
-
-Run the scaffold tool and pass an OpenAPI spec to generate a template Go connector file:
-
-```bash
-go run cmd/conduit-scaffold/main.go -spec /path/to/openapi-spec.json -connector-id my-service
-```
-
-This generates a Go connector file adhering to the Conduit SDK specifications. Place the output file under a new directory in the `connectors/` folder and register it within the `NewGateway()` function in `gateway/server.go`.
