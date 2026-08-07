@@ -4,7 +4,7 @@
 
 Fleet is a model-serving gateway that routes inference traffic across multiple tenants and models, using real-time stream processing to drive canary promote/rollback decisions and scheduled drift detection to catch longer-term model degradation — all while enforcing per-tenant rate limits and cost attribution.
 
-Fleet extends the credential-security and API-client patterns from [Conduit](#) (a Go SDK for third-party integrations) into a live, multi-tenant serving system.
+Fleet extends the credential-security and API-client patterns from [Conduit](https://github.com/navyabijoy/conduit-go) (a Go SDK for third-party integrations) into a live, multi-tenant serving system.
 
 ## Features
 
