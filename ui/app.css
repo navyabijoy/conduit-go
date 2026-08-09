@@ -87,9 +87,45 @@
   /* ── Font stack from stripe_branding.json ── */
   --font: "sohne-var", "SF Pro Display", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --mono: "SFMono-Regular", "SF Mono", "Fira Mono", "Roboto Mono", monospace;
+
+  /* ── Spacing scale (4px base unit, editorial rhythm) ── */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+
+  /* ── Motion ── */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --duration-fast: 0.15s;
+  --duration-base: 0.22s;
 }
 
 html { font-size: 14px; scroll-behavior: smooth; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ─── Focus visibility (accessibility) ───────────────────────────────────── */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+.nav-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
 
 body {
   font-family: var(--font);
@@ -274,15 +310,22 @@ body {
 }
 
 /* ─── Views ────────────────────────────────────────────────────────────────── */
-.view { display: none; padding: 2rem 2.5rem; }
-.view.active { display: block; }
+.view { display: none; padding: var(--space-8) var(--space-10); }
+.view.active {
+  display: block;
+  animation: viewFadeIn var(--duration-base) var(--ease-out);
+}
+@keyframes viewFadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
 
-.section-header { margin-bottom: 1.75rem; }
+.section-header { margin-bottom: var(--space-8); }
 .section-header h1 {
-  font-size: 1.375rem;
+  font-size: 1.5rem;
   font-weight: 600;
   color: var(--text-primary);
-  margin-bottom: 0.3rem;
+  margin-bottom: var(--space-2);
   letter-spacing: -0.03em;
 }
 .section-header h2 {
@@ -294,8 +337,8 @@ body {
 }
 .section-header p {
   color: var(--text-secondary);
-  font-size: 0.875rem;
-  line-height: 1.5;
+  font-size: 0.9375rem;
+  line-height: 1.55;
 }
 
 /* ─── Catalog Grid ─────────────────────────────────────────────────────────── */
@@ -309,18 +352,26 @@ body {
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  padding: 1.375rem;
+  padding: var(--space-6);
   display: flex;
   flex-direction: column;
-  gap: 0.875rem;
-  transition: border-color 0.15s, box-shadow 0.15s;
+  gap: var(--space-3);
+  transition: border-color var(--duration-fast), box-shadow var(--duration-fast), transform var(--duration-fast);
   cursor: default;
   box-shadow: var(--shadow-xs);
+  animation: cardIn var(--duration-base) var(--ease-out) backwards;
+  animation-delay: var(--stagger-delay, 0ms);
 }
 
 .connector-card:hover {
   border-color: var(--border-strong);
   box-shadow: var(--shadow-md);
+  transform: translateY(-2px);
+}
+
+@keyframes cardIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 
 .card-header {
@@ -407,12 +458,14 @@ body {
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  padding: 1rem 1.25rem;
+  padding: var(--space-4) var(--space-5);
   display: flex;
   align-items: center;
-  gap: 1.25rem;
-  transition: border-color 0.15s, box-shadow 0.15s;
+  gap: var(--space-5);
+  transition: border-color var(--duration-fast), box-shadow var(--duration-fast);
   box-shadow: var(--shadow-xs);
+  animation: cardIn var(--duration-base) var(--ease-out) backwards;
+  animation-delay: var(--stagger-delay, 0ms);
 }
 .instance-row:hover {
   border-color: var(--border-strong);
@@ -486,7 +539,27 @@ body {
   border-radius: var(--radius-lg);
   background: var(--bg-surface);
   line-height: 1.5;
+  animation: viewFadeIn var(--duration-base) var(--ease-out);
 }
+
+.loading-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: var(--space-8);
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+}
+.spinner {
+  width: 15px;
+  height: 15px;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 
 /* ─── Execute Panel ────────────────────────────────────────────────────────── */
 .execute-panel { max-width: 720px; display: flex; flex-direction: column; gap: 1.25rem; }
@@ -692,6 +765,7 @@ body {
   background: var(--accent-hover);
   border-color: var(--accent-hover);
   box-shadow: 0 1px 10px rgba(83, 58, 253, 0.55);
+  transform: translateY(-1px);
 }
 .btn-primary:active:not(:disabled) {
   background: var(--accent-active);

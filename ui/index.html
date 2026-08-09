@@ -22,8 +22,8 @@
       </svg>
       <span class="logo-text">Conduit</span>
     </div>
-    <nav class="sidebar-nav">
-      <a href="#" class="nav-item active" data-view="catalog" id="nav-catalog">
+    <nav class="sidebar-nav" aria-label="Primary">
+      <a href="#" class="nav-item active" data-view="catalog" id="nav-catalog" aria-current="page">
         <svg class="nav-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <rect x="2" y="2" width="7" height="7" rx="1.5"/>
           <rect x="11" y="2" width="7" height="7" rx="1.5"/>
@@ -81,7 +81,7 @@
     </header>
 
     <!-- Toast container -->
-    <div class="toast-container" id="toast-container"></div>
+    <div class="toast-container" id="toast-container" role="status" aria-live="polite"></div>
 
     <!-- ── View: Catalog ── -->
     <section class="view active" id="view-catalog">

@@ -3,18 +3,48 @@
    All API calls go to the same origin (Gateway serves both the UI and the API).
 ───────────────────────────────────────────────────────────────────────────── */
 
+/**
+ * @typedef {Object} Connector
+ * @property {string} id
+ * @property {string} name
+ * @property {string} [category]
+ * @property {string} [description]
+ * @property {string[]} [scopes]
+ */
+
+/**
+ * @typedef {Object} Instance
+ * @property {string} id
+ * @property {string} connector_id
+ * @property {string} status
+ */
+
+/** @typedef {{ abbr: string, color: string }} ConnectorMeta */
+
 const API = '';   // Same origin — no base URL prefix needed
 
 // ─── Connector meta (initials + accent colour) ───────────────────────────────
+/** @type {Record<string, ConnectorMeta>} */
 const CONNECTOR_META = {
   slack:  { abbr: 'SL', color: '#E01E5A' },
   github: { abbr: 'GH', color: '#24292F' },
   stripe: { abbr: 'ST', color: '#635BFF' },
 };
 
+/**
+ * @param {string} id
+ * @returns {ConnectorMeta}
+ */
 function connMeta(id) {
   const abbr = id ? id.slice(0, 2).toUpperCase() : '??';
   return CONNECTOR_META[id] || { abbr, color: '#2563EB' };
+}
+
+/** Applies a per-item entrance-animation stagger delay so lists feel choreographed rather than instant. */
+function applyStagger(container) {
+  Array.from(container.children).forEach((child, i) => {
+    child.style.setProperty('--stagger-delay', `${Math.min(i, 8) * 40}ms`);
+  });
 }
 
 // ─── Navigation ──────────────────────────────────────────────────────────────
@@ -32,10 +62,16 @@ document.querySelectorAll('.nav-item').forEach(link => {
   });
 });
 
+/** @param {string} name */
 function switchView(name) {
-  document.querySelectorAll('.nav-item').forEach(l => l.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(l => {
+    l.classList.remove('active');
+    l.removeAttribute('aria-current');
+  });
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-  document.getElementById('nav-' + name)?.classList.add('active');
+  const navLink = document.getElementById('nav-' + name);
+  navLink?.classList.add('active');
+  navLink?.setAttribute('aria-current', 'page');
   document.getElementById('view-' + name)?.classList.add('active');
   document.getElementById('view-title').textContent = VIEW_TITLES[name] || name;
 
@@ -49,6 +85,7 @@ function switchView(name) {
 async function loadCatalog() {
   const grid = document.getElementById('catalog-grid');
   try {
+    /** @type {Connector[]} */
     const connectors = await apiFetch('/v1/connectors');
     grid.innerHTML = '';
 
@@ -60,11 +97,13 @@ async function loadCatalog() {
     for (const conn of connectors) {
       grid.appendChild(buildConnectorCard(conn));
     }
+    applyStagger(grid);
   } catch (err) {
     grid.innerHTML = `<div class="empty-state">Failed to load catalog: ${err.message}</div>`;
   }
 }
 
+/** @param {Connector} conn */
 function buildConnectorCard(conn) {
   const meta = connMeta(conn.id);
   const card = el('div', 'connector-card');
@@ -92,10 +131,15 @@ function buildConnectorCard(conn) {
 }
 
 // ─── Install Modal ────────────────────────────────────────────────────────────
+/** @type {Connector | null} */
 let _installing = null;
+/** @type {HTMLElement | null} Element focused before the modal opened, restored on close. */
+let _preModalFocus = null;
 
+/** @param {Connector} conn */
 function openInstallModal(conn) {
   _installing = conn;
+  _preModalFocus = /** @type {HTMLElement} */ (document.activeElement);
   const meta = connMeta(conn.id);
   const modal = document.getElementById('install-modal');
   const body  = document.getElementById('modal-body');
@@ -127,16 +171,45 @@ function openInstallModal(conn) {
   }
 
   modal.style.display = 'flex';
+  // Focus the first interactive control inside the modal for keyboard users.
+  modal.querySelector('.modal input, .modal button')?.focus();
 }
 
 function closeInstallModal() {
   document.getElementById('install-modal').style.display = 'none';
   _installing = null;
+  _preModalFocus?.focus();
+  _preModalFocus = null;
 }
 
+const installModalEl = document.getElementById('install-modal');
+
 // Close modal on backdrop click
-document.getElementById('install-modal').addEventListener('click', e => {
+installModalEl.addEventListener('click', e => {
   if (e.target === e.currentTarget) closeInstallModal();
+});
+
+// Escape-to-close and a focus trap so Tab cannot leave the dialog while it's open.
+installModalEl.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    closeInstallModal();
+    return;
+  }
+  if (e.key !== 'Tab') return;
+
+  const focusable = Array.from(installModalEl.querySelectorAll('button, input, select, textarea, a[href]'))
+    .filter(node => !node.disabled && node.offsetParent !== null);
+  if (focusable.length === 0) return;
+
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (e.shiftKey && document.activeElement === first) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault();
+    first.focus();
+  }
 });
 
 async function installOAuth(connectorID) {
@@ -175,8 +248,9 @@ async function installAPIKey(connectorID) {
 // ─── Instances ────────────────────────────────────────────────────────────────
 async function loadInstances() {
   const list = document.getElementById('instances-list');
-  list.innerHTML = '<div class="empty-state" style="opacity:0.5">Loading…</div>';
+  list.innerHTML = '<div class="loading-state"><span class="spinner"></span> Loading instances…</div>';
   try {
+    /** @type {Instance[]} */
     const instances = await apiFetch('/v1/instances');
     updateBadge(instances?.length || 0);
     document.getElementById('metric-instances-count').textContent = instances?.length ?? 0;
@@ -190,11 +264,13 @@ async function loadInstances() {
     for (const inst of instances) {
       list.appendChild(buildInstanceRow(inst));
     }
+    applyStagger(list);
   } catch (err) {
     list.innerHTML = `<div class="empty-state">Failed to load instances: ${err.message}</div>`;
   }
 }
 
+/** @param {Instance} inst */
 function buildInstanceRow(inst) {
   const meta = connMeta(inst.connector_id);
   const statusClass = `status-${inst.status}`;

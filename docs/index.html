@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Conduit — Self-Hosted Integration Gateway</title>
+  <meta name="description" content="A self-hosted integration gateway for Slack, GitHub, Stripe, and other third-party APIs. OAuth refresh, encrypted credential storage, and rate-limit handling — done once, run yourself." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ── Nav ── -->
+  <header class="nav">
+    <div class="nav-inner">
+      <a href="#top" class="nav-brand">
+        <svg viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" class="nav-logo">
+          <rect x="2" y="2" width="10" height="10" rx="1" fill="#533AFD"/>
+          <rect x="16" y="2" width="10" height="10" rx="1" fill="#533AFD" opacity="0.6"/>
+          <rect x="2" y="16" width="10" height="10" rx="1" fill="#FF6118" opacity="0.8"/>
+          <rect x="16" y="16" width="10" height="10" rx="1" fill="#FF6118" opacity="0.4"/>
+        </svg>
+        Conduit
+      </a>
+      <nav class="nav-links">
+        <a href="#use-cases">Use Cases</a>
+        <a href="#features">Features</a>
+        <a href="#how-it-works">How it Works</a>
+        <a href="#compare">Why Self-Hosted</a>
+      </nav>
+      <a href="https://github.com/navyabijoy/conduit-go" class="btn btn-outline nav-cta" target="_blank" rel="noopener">
+        <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.02 1.93-.02 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        View on GitHub
+      </a>
+    </div>
+  </header>
+
+  <!-- ── Hero ── -->
+  <section class="hero" id="top">
+    <div class="hero-inner">
+      <div class="hero-copy">
+        <span class="badge-pill">Open source · MIT licensed</span>
+        <h1>Stop rebuilding OAuth refresh, credential encryption, and rate-limit handling for every connector.</h1>
+        <p class="hero-sub">Conduit is a self-hosted integration gateway for Slack, GitHub, Stripe, and beyond — the boilerplate every team writes once per third-party API, done correctly, once, as a service you run yourself.</p>
+        <div class="hero-actions">
+          <a href="#quickstart" class="btn btn-primary">Try it in 30 seconds</a>
+          <a href="https://github.com/navyabijoy/conduit-go" class="btn btn-secondary" target="_blank" rel="noopener">View source</a>
+        </div>
+        <div class="hero-meta">
+          <span>No signup</span><span class="dot">·</span><span>No API keys required to try</span><span class="dot">·</span><span>Runs on your infra</span>
+        </div>
+      </div>
+
+      <div class="hero-visual" aria-hidden="true">
+        <div class="terminal">
+          <div class="terminal-bar">
+            <span class="dot red"></span><span class="dot yellow"></span><span class="dot green"></span>
+            <span class="terminal-title">conduit — zsh</span>
+          </div>
+          <pre class="terminal-body"><code id="terminal-code"></code><span class="cursor">&#8203;</span></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Use Cases ── -->
+  <section class="section" id="use-cases">
+    <div class="section-inner">
+      <h2>Built for the integration work everyone re-does</h2>
+      <p class="section-lead">Four situations Conduit is built to remove, straight from the boilerplate you'd otherwise write yourself.</p>
+      <div class="grid grid-2">
+        <div class="feature-card">
+          <div class="feature-icon">🔐</div>
+          <h3>Customers connect their own Slack/GitHub/Stripe</h3>
+          <p>Point customers at Conduit's install endpoint. It runs the OAuth flow, refreshes tokens automatically, and encrypts credentials at rest — you never touch a raw token.</p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-icon">⏱</div>
+          <h3>Rate-limited APIs, without hand-rolled backoff</h3>
+          <p>Conduit's client already understands Slack's <code>Retry-After</code> header and GitHub's <code>X-RateLimit-*</code> headers, with exponential backoff and jitter for everything else.</p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-icon">📡</div>
+          <h3>Inbound webhooks, verified correctly</h3>
+          <p>HMAC-SHA256 signature verification, done once in the SDK, instead of once per integration you build.</p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-icon">🩺</div>
+          <h3>Know when a provider's API quietly changes</h3>
+          <p>A background drift detector probes each connector, diffs the response shape against a stored baseline, and flags it before it silently breaks something downstream.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Features ── -->
+  <section class="section section-alt" id="features">
+    <div class="section-inner">
+      <h2>What's actually in the box</h2>
+      <div class="grid grid-3">
+        <div class="feature-card feature-card--flat">
+          <h3>Unified connector interface</h3>
+          <p>One Go interface — <code>AuthConfig</code>, <code>Endpoints</code>, <code>HandleWebhook</code>. Slack, GitHub, and Stripe implement it today; add your own the same way.</p>
+        </div>
+        <div class="feature-card feature-card--flat">
+          <h3>OAuth2 + API-key auth</h3>
+          <p>Automatic token refresh on expiry or <code>401</code>. Credentials encrypted at rest with AES-256-GCM.</p>
+        </div>
+        <div class="feature-card feature-card--flat">
+          <h3>Provider-aware rate limiting</h3>
+          <p>Exponential backoff with jitter, tuned to each provider's actual rate-limit response format.</p>
+        </div>
+        <div class="feature-card feature-card--flat">
+          <h3>Drift detection</h3>
+          <p>Scheduled probes diff live responses against a stored baseline schema, and alert on change.</p>
+        </div>
+        <div class="feature-card feature-card--flat">
+          <h3>Observability built in</h3>
+          <p>Prometheus metrics at <code>/metrics</code>; an auto-generated OpenAPI spec and Swagger UI at <code>/docs</code>.</p>
+        </div>
+        <div class="feature-card feature-card--flat">
+          <h3>Dashboard UI</h3>
+          <p>A no-build-step dashboard for browsing the catalog, managing instances, and executing endpoints directly.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── How it Works ── -->
+  <section class="section" id="how-it-works">
+    <div class="section-inner">
+      <h2>From clone to executed request, in five steps</h2>
+      <ol class="steps">
+        <li><span class="step-num">1</span><div><strong>Clone and run.</strong> <code>docker run</code> or <code>go run ./cmd/gateway</code> — boots with a built-in mock provider, no API keys needed.</div></li>
+        <li><span class="step-num">2</span><div><strong>Open the dashboard.</strong> Browse the connector catalog at <code>localhost:8080/ui/</code>.</div></li>
+        <li><span class="step-num">3</span><div><strong>Install a connector.</strong> API-key connectors (like Stripe) prompt for a key; OAuth2 connectors (like Slack, GitHub) redirect through a consent flow.</div></li>
+        <li><span class="step-num">4</span><div><strong>Execute an endpoint.</strong> Pick the instance and endpoint, send the request, see the live response.</div></li>
+        <li><span class="step-num">5</span><div><strong>Swap in real credentials.</strong> Point at real provider OAuth apps and API keys when you're ready to go beyond the mock demo.</div></li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- ── Why Self-Hosted ── -->
+  <section class="section section-dark" id="compare">
+    <div class="section-inner">
+      <h2>Why self-hosted instead of Nango, Merge, or Paragon</h2>
+      <p class="section-lead section-lead--dark">Those are good products with far more pre-built connectors than Conduit has today. The tradeoff is control and cost.</p>
+      <div class="grid grid-2">
+        <div class="compare-card">
+          <h3>Pick a hosted platform if…</h3>
+          <p>You need broad, ready-made connector coverage right now and don't want to run infrastructure yourself.</p>
+        </div>
+        <div class="compare-card compare-card--accent">
+          <h3>Pick Conduit if…</h3>
+          <p>You specifically need Slack/GitHub/Stripe (or want to add your own connector against a plain Go interface), and would rather not send customer credentials to a third party or pay per API call.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Quickstart / CTA ── -->
+  <section class="section" id="quickstart">
+    <div class="section-inner section-inner--narrow">
+      <h2>Try it now</h2>
+      <p class="section-lead">No signup. No API keys. Runs entirely on your machine.</p>
+      <div class="code-block">
+        <div class="code-block-header">
+          <span>Terminal</span>
+          <button class="copy-btn" id="copy-btn" type="button">Copy</button>
+        </div>
+        <pre><code id="quickstart-code">git clone https://github.com/navyabijoy/conduit-go.git
+cd conduit-go
+docker build -t conduit .
+docker run -p 8080:8080 -p 8081:8081 conduit</code></pre>
+      </div>
+      <p class="section-lead" style="margin-top: var(--space-6);">or without Docker: <code>go run ./cmd/gateway</code></p>
+      <div class="hero-actions" style="justify-content:center; margin-top: var(--space-8);">
+        <a href="https://github.com/navyabijoy/conduit-go" class="btn btn-primary" target="_blank" rel="noopener">View on GitHub</a>
+        <a href="https://github.com/navyabijoy/conduit-go#readme" class="btn btn-secondary" target="_blank" rel="noopener">Read the docs</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Footer ── -->
+  <footer class="footer">
+    <div class="footer-inner">
+      <span>Conduit — MIT licensed.</span>
+      <a href="https://github.com/navyabijoy/conduit-go" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/navyabijoy/conduit-go/blob/main/LICENSE" target="_blank" rel="noopener">License</a>
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
