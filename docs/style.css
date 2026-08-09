@@ -1,5 +1,5 @@
 /* ─────────────────────────────────────────────────────────────────────────────
-   Conduit — Landing Page
+   Conduit - Landing Page
    Structure/spacing/hierarchy inspired by DESIGN.md (editorial pacing, pill CTAs,
    single-accent scarcity, dark hero band); colors are Conduit's own brand
    (purple #533AFD / orange #FF6118), not Coinbase's.
@@ -260,6 +260,16 @@ a:focus-visible, button:focus-visible {
   white-space: pre-wrap;
   word-break: break-word;
 }
+/* Reset the global inline-code style (background/padding/radius) for the
+   terminal transcript — that styling is meant for prose snippets like
+   <code>AuthConfig</code>, not this multi-line block. */
+.terminal-body code {
+  background: none;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+  color: inherit;
+}
 .terminal-body .prompt { color: #8fb8ff; }
 .cursor {
   display: inline-block;
@@ -317,7 +327,7 @@ a:focus-visible, button:focus-visible {
   box-shadow: var(--shadow-soft);
   transition: transform 0.2s var(--ease-out), box-shadow 0.2s;
 }
-/* Content is visible by default — JS opts individual cards into a pre-reveal
+/* Content is visible by default; JS opts individual cards into a pre-reveal
    hidden state (see app.js) only for cards it can guarantee it will animate
    back in. This avoids permanently-invisible content if IntersectionObserver
    never fires (slow scroll, crawlers, screenshot tools). */

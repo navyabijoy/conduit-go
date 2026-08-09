@@ -1,5 +1,5 @@
 /**
- * Conduit landing page — terminal typewriter, copy-to-clipboard, scroll reveal.
+ * Conduit landing page: terminal typewriter, copy-to-clipboard, scroll reveal.
  * No build step, no dependencies.
  */
 
@@ -26,8 +26,13 @@ async function typeTerminal() {
     return;
   }
 
-  for (const line of TERMINAL_LINES) {
-    const lineSpan = document.createElement('div');
+  // <code> only permits inline (phrasing) content per the HTML spec; using
+  // block-level <div> lines here caused browsers to split it into anonymous
+  // inline box fragments, which rendered as a stray glyph at the boundary.
+  // <span> + a literal "\n" text node (preserved by white-space: pre-wrap)
+  // stays inline-legal and avoids that.
+  for (const [i, line] of TERMINAL_LINES.entries()) {
+    const lineSpan = document.createElement('span');
     if (line.cls) lineSpan.className = line.cls;
     el.appendChild(lineSpan);
 
@@ -35,6 +40,7 @@ async function typeTerminal() {
       lineSpan.textContent += char;
       await sleep(line.cls === 'prompt' ? 22 : 4);
     }
+    if (i < TERMINAL_LINES.length - 1) el.appendChild(document.createTextNode('\n'));
     await sleep(120);
   }
 }
@@ -46,7 +52,7 @@ function sleep(ms) {
 
 /**
  * Fades feature cards in as they enter the viewport. Cards are visible by
- * default (see style.css) — this only opts cards currently below the fold
+ * default (see style.css); this only opts cards currently below the fold
  * into a hidden-then-reveal state, so a card can never end up permanently
  * invisible if IntersectionObserver doesn't fire for it.
  */
