@@ -46,6 +46,13 @@ Then open **http://localhost:8080/ui/** — install a connector from the catalog
 5. Try **Install** on Slack or GitHub instead — those use OAuth2, so you're redirected through a consent flow (against the mock provider) rather than typing a key, landing on a success page once the token exchange completes.
 6. Check the **Metrics** tab for links to `/metrics` (Prometheus) and `/docs` (OpenAPI/Swagger UI) — both reflect whatever's actually registered, not a static example.
 
+<img width="1792" height="1026" alt="image" src="https://github.com/user-attachments/assets/144ad3a8-d62f-4792-b7f2-c2b551b478d0" />
+
+<img width="1789" height="1027" alt="image" src="https://github.com/user-attachments/assets/43af3700-c440-43cc-80b8-8f996154ae65" />
+
+<img width="1788" height="1027" alt="image" src="https://github.com/user-attachments/assets/a03be72e-94bf-450f-9815-8d888b73e152" />
+
+
 ## What it actually does
 
 - **Unified connector interface** (`sdk.Connector`) — one Go interface (`AuthConfig`, `Endpoints`, `HandleWebhook`) that Slack, GitHub, and Stripe connectors implement today; add your own by implementing the same interface.
