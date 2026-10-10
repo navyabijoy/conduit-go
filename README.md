@@ -1,108 +1,163 @@
 # Conduit
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Go](https://img.shields.io/badge/go-1.26-00ADD8.svg)
 
-**A self-hosted integration gateway for Slack, GitHub, Stripe, and other third-party APIs — so you stop re-writing OAuth refresh, credential encryption, and rate-limit handling for every connector.**
+**A self-hosted integration gateway written in Go.** Conduit gives third-party API integrations one shared layer for OAuth, encrypted credential storage, retries and rate limits, webhook verification, and schema-drift detection, so each new connector only has to describe its own endpoints.
 
-Every team that integrates third-party APIs ends up building the same boilerplate: OAuth token exchange and refresh, encrypted credential storage, retry/backoff tuned to each provider's rate-limit format, webhook signature verification, and some way to notice when a provider's response shape quietly changes underneath you. Conduit gives you that layer as a small Go service you run yourself — no SaaS subscription, no sending your customers' credentials to a third party.
+> Runs end to end against a built-in mock provider, so you can try the whole flow with no accounts or keys.
 
-## Use cases
+<img width="1792" height="1026" alt="Conduit dashboard" src="https://github.com/user-attachments/assets/144ad3a8-d62f-4792-b7f2-c2b551b478d0" />
 
-- **Your SaaS needs customers to connect their own Slack/GitHub/Stripe.** Instead of hand-rolling OAuth install flows and encrypted token storage per provider, point customers at Conduit's install endpoint and let it handle the OAuth dance, token refresh, and credential encryption.
-- **You're calling a rate-limited third-party API and tired of writing backoff logic.** Conduit's HTTP client already knows Slack's and GitHub's rate-limit header formats and backs off correctly; call through it instead of re-deriving that per project.
-- **You receive webhooks from a provider and need signature verification done correctly.** The HMAC helpers in `sdk/webhook.go` handle this once, instead of once per integration.
-- **You want to know when a provider's API response shape changes** before it breaks your integration silently — the drift detector flags it.
-- **You don't want a third party holding your customers' OAuth tokens.** Self-hosted means the credentials never leave infrastructure you control.
+## Contents
 
-## Why self-hosted instead of Nango/Merge/Paragon
+- [Quick start](#quick-start)
+- [What it does](#what-it-does)
+- [Architecture](#architecture)
+- [API reference](#api-reference)
+- [Configuration](#configuration)
+- [Adding a connector](#adding-a-connector)
+- [Project layout](#project-layout)
+- [Testing](#testing)
+- [Roadmap](#roadmap)
+- [License](#license)
 
-Those are good products with far more pre-built connectors than Conduit has today (3, vs. their hundreds). The tradeoff is control and cost: no per-API-call pricing, no vendor holding your customers' credentials, and no dependency on a third party staying in business. If you need broad, ready-made connector coverage right now, they're the better fit. If you specifically need Slack/GitHub/Stripe (or want to add your own connector against a straightforward Go interface) and would rather self-host, that's what Conduit is for.
+## Quick start
 
-## Try it in 30 seconds
-
-No API keys, no signup, no config. Conduit ships with a built-in mock provider so you can see the whole flow — install a connector, watch it authenticate, execute an endpoint — against fake Slack/GitHub/Stripe backends.
+No API keys, signup, or config needed.
 
 ```bash
 git clone https://github.com/navyabijoy/conduit-go.git
 cd conduit-go
+go run ./cmd/gateway
+```
+
+Or with Docker:
+
+```bash
 docker build -t conduit .
 docker run -p 8080:8080 -p 8081:8081 conduit
 ```
 
-or without Docker:
+Open **http://localhost:8080/ui/**.
 
-```bash
-go run ./cmd/gateway
-```
+### Walkthrough
 
-Then open **http://localhost:8080/ui/** — install a connector from the catalog, install it, and execute a request against the mock backend, all from the dashboard.
+1. **Catalog**: Slack, GitHub, and Stripe are listed with the scopes they request. Click **Install** on Stripe (API-key auth, the simplest).
+2. Enter any non-empty key, such as `sk_test_demo`. It is validated against the mock backend.
+3. Conduit encrypts the key with AES-256-GCM and stores it in SQLite. The new instance appears under **Instances** with status `active`.
+4. **Execute** an endpoint such as `list_charges` and see the response.
+5. Install Slack or GitHub to see the OAuth2 flow: redirect, consent on the mock provider, callback, token exchange.
+6. **Metrics** links to `/metrics` (Prometheus) and `/docs` (Swagger UI).
 
-## Walkthrough: your first connector
+<img width="1789" height="1027" alt="Instances view" src="https://github.com/user-attachments/assets/43af3700-c440-43cc-80b8-8f996154ae65" />
 
-1. **Catalog tab** — you'll see Slack, GitHub, and Stripe listed, each with the scopes they request. Click **Install** on Stripe (simplest, since it's API-key auth, not OAuth).
-2. A modal asks for an API key. Since you're running in mock mode, any non-empty value works (e.g. `sk_test_demo`) — it's validated against the mock Stripe backend, not the real one.
-3. Conduit encrypts that key (AES-256-GCM) and stores it, then switches you to the **Instances** tab where your new Stripe instance shows status `active`.
-4. Click **Execute** on that instance, or go to the **Execute** tab directly — pick the instance, pick an endpoint (e.g. `list_charges`), and send the request. You'll see the raw response from the mock Stripe backend.
-5. Try **Install** on Slack or GitHub instead — those use OAuth2, so you're redirected through a consent flow (against the mock provider) rather than typing a key, landing on a success page once the token exchange completes.
-6. Check the **Metrics** tab for links to `/metrics` (Prometheus) and `/docs` (OpenAPI/Swagger UI) — both reflect whatever's actually registered, not a static example.
+## What it does
 
-<img width="1792" height="1026" alt="image" src="https://github.com/user-attachments/assets/144ad3a8-d62f-4792-b7f2-c2b551b478d0" />
-
-<img width="1789" height="1027" alt="image" src="https://github.com/user-attachments/assets/43af3700-c440-43cc-80b8-8f996154ae65" />
-
-<img width="1788" height="1027" alt="image" src="https://github.com/user-attachments/assets/a03be72e-94bf-450f-9815-8d888b73e152" />
-
-
-## What it actually does
-
-- **Unified connector interface** (`sdk.Connector`) — one Go interface (`AuthConfig`, `Endpoints`, `HandleWebhook`) that Slack, GitHub, and Stripe connectors implement today; add your own by implementing the same interface.
-- **OAuth2 + API-key auth, handled for you** — automatic token refresh on expiry or `401`, with credentials encrypted at rest using AES-256-GCM (`gateway/db.go`).
-- **Provider-aware rate-limit handling** — the HTTP client (`sdk/client.go`) understands Slack's `Retry-After` header and GitHub's `X-RateLimit-Remaining`/`X-RateLimit-Reset` headers, with exponential backoff and jitter for everything else.
-- **Webhook signature verification** — HMAC-SHA256 helpers (`sdk/webhook.go`) so inbound webhooks are verified before they're processed.
-- **Drift detection** — a background worker periodically probes each installed connector, diffs the response shape against a stored baseline, and flags/alerts when a provider's API quietly changes.
-- **Observability out of the box** — Prometheus metrics (`/metrics`) for request latency, error rates, token refresh outcomes, and drift detections; an auto-generated OpenAPI spec and Swagger UI (`/docs`) reflected from each connector's declared endpoints.
-- **Dashboard UI** — a lightweight, no-build-step dashboard (`ui/`) for browsing the connector catalog, managing installed instances, executing endpoints, and checking observability links.
+| Feature | How it works | Where |
+|---|---|---|
+| **Connector interface** | A connector implements `Metadata`, `AuthConfig`, `Endpoints`, and `HandleWebhook`. Auth, pagination, and webhook contracts are shared. | `sdk/connector.go` |
+| **OAuth2 and API-key auth** | OAuth install flow with a random `state` value. The HTTP client refreshes tokens through a hook when they expire or the API returns `401`. | `gateway/routes_catalog.go`, `sdk/client.go` |
+| **Encrypted credentials** | AES-256-GCM with a random nonce per value, stored in SQLite. In production (`CONDUIT_ENV=production`) startup fails without a 32-byte key. | `gateway/db.go` |
+| **Rate limits and retries** | Honors Slack's `Retry-After` and GitHub's `X-RateLimit-*` headers. Other failures use exponential backoff with jitter. Errors are classed as transient or permanent. | `sdk/client.go`, `sdk/errors.go` |
+| **Pagination** | A shared paginator abstraction that endpoints can plug into. | `sdk/pagination.go` |
+| **Webhook verification** | HMAC-SHA256 check of the inbound signature before an event is accepted. | `sdk/webhook.go`, `gateway/routes_webhook.go` |
+| **OpenAPI and Swagger UI** | The spec is generated at runtime. Go `reflect` turns each endpoint's input and output structs into OpenAPI schemas. | `gateway/openapi.go` |
+| **Drift detection** | A goroutine polls every 30 seconds, flattens each response into a field-to-type map, diffs it against the baseline captured at install, and posts an alert to `CONDUIT_ALERT_WEBHOOK_URL` if set. | `gateway/drift.go` |
+| **Metrics** | Prometheus metrics for request latency, request errors, token refreshes, webhook failures, and drift detections. | `gateway/metrics.go` |
+| **Connector scaffolding** | `conduit-scaffold` generates a connector skeleton from an OpenAPI 3.x JSON spec. It uses templates, or Gemini when `GEMINI_API_KEY` is set. | `cmd/conduit-scaffold` |
 
 ## Architecture
 
-```
-┌──────────┐   installs / executes   ┌────────────────────┐
-│ Dashboard│ ───────────────────────▶│   Conduit Gateway   │
-│  (ui/)   │◀─────────────────────── │  (gateway/, sdk/)   │
-└──────────┘                          └─────────┬──────────┘
-                                                 │
-                        ┌────────────────────────┼────────────────────────┐
-                        ▼                        ▼                        ▼
-                 ┌─────────────┐          ┌─────────────┐          ┌─────────────┐
-                 │   Slack     │          │   GitHub    │          │   Stripe    │
-                 │ connector   │          │  connector  │          │  connector  │
-                 └─────────────┘          └─────────────┘          └─────────────┘
-                        │                        │                        │
-                        └────────── real API, or the built-in ────────────┘
-                                     mock server (mock/) for local dev
+The gateway is a single Go binary. The dashboard is plain static files served by the same process.
+
+```mermaid
+flowchart LR
+    UI[Dashboard UI] -->|REST| Routes[Gateway routes]
+    Routes -->|lookup by ID| Registry[Connectors<br/>slack / github / stripe]
+    Registry -->|Execute| Client[SDK HTTPClient<br/>retry, backoff, refresh]
+    Client -->|HTTP| Provider[Provider APIs<br/>mock server :8081]
+    Routes -->|instances, creds| DB[(SQLite<br/>AES-256-GCM)]
+    Drift[Drift detector<br/>30s ticker] --> DB
+    Drift -->|probe endpoint| Registry
+    OpenAPI[OpenAPI + Swagger] -.->|reflect on Endpoints| Registry
+    Routes --> OpenAPI
 ```
 
-Credentials are encrypted with AES-256-GCM and persisted in SQLite (`gateway/db.go`) — no external database required to run it.
+**Executing an endpoint** (`POST /v1/instances/{id}/endpoints/{name}`):
+
+1. Load the instance from SQLite and look up its connector in the registry.
+2. Find the endpoint by name, then load and decrypt the instance's credentials.
+3. Build an `sdk.HTTPClient` with a token-refresh hook and call the endpoint's `Execute` under a 30-second timeout.
+4. Record latency and error metrics, then return the provider's response.
+
+## API reference
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/connectors` | List the connector catalog |
+| `POST` | `/v1/connectors/{id}/install` | Start an install (OAuth redirect, or API-key submit) |
+| `GET` | `/oauth/callback` | OAuth redirect target |
+| `GET` | `/v1/instances` | List installed instances |
+| `GET` / `DELETE` | `/v1/instances/{id}` | Fetch or remove an instance |
+| `POST` | `/v1/instances/{id}/endpoints/{name}` | Execute a connector endpoint |
+| `POST` | `/webhooks/{instance_id}` | Receive a signed provider webhook |
+| `GET` | `/openapi.json`, `/docs` | OpenAPI spec and Swagger UI |
+| `GET` | `/metrics` | Prometheus metrics |
+| `GET` | `/ui/` | Dashboard |
 
 ## Configuration
 
-Copy `.env.example` to `.env` for a real (non-demo) deployment — see that file for what each variable does. Nothing in it is required to try Conduit locally; the demo path above runs with zero configuration.
+Nothing is required for the local demo. For a real deployment, copy `.env.example` to `.env`.
 
-## Project layout
-
-| Path | What's there |
+| Variable | Purpose |
 |---|---|
-| `sdk/` | The core client library — HTTP client with retries/backoff/rate-limiting, auth types, the `Connector` interface, error classification, pagination, webhook verification. |
-| `connectors/` | Per-service implementations of `sdk.Connector` (`github/`, `slack/`, `stripe/`). |
-| `gateway/` | The HTTP API server — connector catalog, OAuth install flow, instance management, webhook receiver, drift detector, metrics, OpenAPI spec. |
-| `mock/` | A mock third-party server standing in for real Slack/GitHub/Stripe APIs, used by the demo path and tests. |
-| `ui/` | The dashboard — plain HTML/CSS/JS, no build step. |
-| `cmd/gateway/` | The gateway binary entrypoint. |
+| `CONDUIT_ENV` | Set to `production` to require an encryption key at startup |
+| `CONDUIT_ENCRYPTION_KEY` | Exactly 32 bytes; encrypts stored credentials. Development mode uses a built-in key, so set your own for real data. |
+| `CONDUIT_WEBHOOK_SECRET` | Shared HMAC secret for webhook signatures |
+| `CONDUIT_ALERT_WEBHOOK_URL` | Optional URL that receives drift alerts |
+
+Flags on `cmd/gateway`: `-addr` (default `:8080`), `-db` (default `./conduit.db`), `-mock` (default `true`), `-mock-addr` (default `:8081`), `-webhook-secret`.
 
 ## Adding a connector
 
-Implement `sdk.Connector` (see `connectors/slack/` for a complete example) and register it in `gateway/server.go`'s `NewGateway`. `cmd/conduit-scaffold` can generate the boilerplate for a new connector package.
+1. Create `connectors/<name>/` with a type that implements `sdk.Connector` (`connectors/stripe/` is the shortest example). Declare each endpoint with its name, method, path, input and output structs, and an `Execute` function. The structs feed the generated OpenAPI spec.
+2. Register it in the `registry` map in `NewGateway` (`gateway/server.go`).
+3. Optionally generate the skeleton first:
+   ```bash
+   go run ./cmd/conduit-scaffold -spec ./openapi.json -out ./connectors/myservice
+   ```
+
+The connector itself needs no changes to the SDK.
+
+## Project layout
+
+| Path | Contents |
+|---|---|
+| `sdk/` | Connector interface, HTTP client (retry, backoff, rate limits, token refresh), auth types, errors, pagination, webhook verification |
+| `connectors/` | `slack/`, `github/`, `stripe/` |
+| `gateway/` | HTTP server, routes, SQLite and encryption, drift detector, metrics, OpenAPI generation |
+| `mock/` | Mock Slack, GitHub, and Stripe provider for the demo and tests |
+| `cmd/gateway/` | Gateway binary |
+| `cmd/conduit-scaffold/` | Connector generator |
+| `ui/` | Dashboard (HTML, CSS, JS; no build step) |
+| `docs/` | Landing page (GitHub Pages) |
+
+## Testing
+
+```bash
+go test ./...
+```
+
+Covers the SDK (client, pagination, webhooks), the Stripe connector, the gateway, the mock server, and the scaffolder. The Slack and GitHub connectors have no tests of their own yet.
+
+## Roadmap
+
+- Make provider base URLs configurable so connectors can target live APIs as well as the mock.
+- Move drift probe construction into the `Connector` interface so any connector can be monitored.
+- Add gateway API authentication.
+- Add tests for the Slack and GitHub connectors.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

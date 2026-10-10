@@ -1,101 +1,96 @@
-# Fleet — Operational Requirements Document (ORD)
+# Conduit: Operational Requirements Document (ORD)
 
 ## 1. Overview
 
-**Fleet** is a multi-tenant model-serving gateway that sits in front of ML inference endpoints, routing and governing traffic for multiple tenants and multiple models per tenant. It combines real-time stream processing for canary safety decisions with scheduled batch jobs for drift detection, while enforcing rate limits and cost attribution per tenant.
+**Conduit** is a self-hosted integration gateway written in Go. It sits between an application and third-party SaaS APIs (Slack, GitHub, Stripe today) and provides the shared plumbing every integration needs: OAuth and API-key auth, encrypted credential storage, retries and rate-limit handling, webhook verification, schema-drift detection, and generated API documentation.
 
-Fleet extends design patterns from **Conduit** (a prior Go SDK for third-party integrations with AES-256-GCM credential security), applying the same credential-handling and API-client conventions to a live serving system.
+Connectors implement one Go interface (`sdk.Connector`). The gateway, SDK, and dashboard are shared by all of them.
 
 ## 2. Problem Statement
 
-Serving ML models to multiple tenants introduces risks that a single-tenant setup doesn't have:
+Teams that integrate several third-party APIs rebuild the same pieces for each one:
 
-- A bad model rollout for one tenant can silently degrade latency or accuracy without fast detection.
-- Tenants share infrastructure, so noisy-neighbor traffic can starve others without rate limiting.
-- Model quality drifts over time as production data shifts, and this is easy to miss without scheduled monitoring.
-- Without per-tenant cost attribution, infra spend can't be fairly billed or capacity-planned.
+- OAuth install, token exchange, and refresh, each with provider-specific quirks.
+- Safe storage for customer credentials.
+- Retry and backoff tuned to each provider's rate-limit signals.
+- Webhook signature verification.
+- Noticing when a provider's response shape changes before it breaks the integration.
+- Keeping API documentation in sync with what is actually integrated.
 
-Fleet addresses all four by combining real-time stream monitoring, scheduled drift detection, and enforcement (rate limiting + cost tracking) in one gateway.
+Conduit centralizes these so a new connector only declares its auth, endpoints, and webhook handling.
 
 ## 3. Goals
 
-1. Route inference requests per tenant/model with sub-second added latency from the gateway itself.
-2. Detect model degradation (error rate, latency) in near real time and support automatic canary rollback.
-3. Detect longer-term data/model drift on a scheduled cadence and flag degrading tenant-model pairs.
-4. Enforce per-tenant rate limits to prevent noisy-neighbor effects.
-5. Attribute infra cost per tenant for chargeback/capacity planning.
+1. Define a single connector contract (auth config, endpoints, webhook handler) shared by all integrations.
+2. Handle OAuth2 and API-key auth, including automatic token refresh.
+3. Encrypt stored credentials at rest.
+4. Make outbound calls resilient: honor provider rate-limit headers and back off on transient errors.
+5. Verify inbound webhook signatures before processing.
+6. Detect response-schema drift against a baseline captured at install time.
+7. Generate OpenAPI documentation from the registered connectors' endpoint definitions.
+8. Expose metrics for requests, errors, token refreshes, webhook failures, and drift detections.
+9. Run with zero configuration for local evaluation, using a built-in mock provider.
 
 ### Non-Goals
 
-- Fleet does not train or fine-tune models — it only serves and monitors already-trained models.
-- Fleet does not manage model artifact storage long-term (delegated to MLflow/BentoML registries).
+- Conduit is not a hosted service and does not manage multi-tenant billing.
+- Conduit does not yet ship connectors beyond Slack, GitHub, and Stripe.
+- Conduit does not implement gateway-level authentication of its own API callers; deploy it behind your own network controls.
 
 ## 4. Functional Requirements
 
-| ID | Requirement |
-|----|-------------|
-| FR1 | Gateway accepts inference requests, authenticates the tenant, and routes to the correct model version. |
-| FR2 | All requests/responses are streamed to Kafka for downstream processing. |
-| FR3 | A PyFlink job consumes the stream and computes rolling per-tenant/per-model error rate and latency windows. |
-| FR4 | Rolling window metrics are written to Feast (online store) and used to drive canary promote/rollback decisions. |
-| FR5 | Gateway enforces canary rollback automatically when a model-tenant pair breaches a configured error/latency threshold. |
-| FR6 | An Airflow DAG runs nightly Evidently AI drift detection jobs per tenant-model pair and flags degrading pairs. |
-| FR7 | Gateway enforces Redis-backed per-tenant rate limits (requests/sec, configurable per tenant tier). |
-| FR8 | Gateway logs per-request cost (compute + model tier) to PostgreSQL for per-tenant cost attribution. |
-| FR9 | Model artifacts are packaged/served via BentoML and tracked via MLflow. |
+| ID | Requirement | Implemented in |
+|----|-------------|----------------|
+| FR1 | A connector exposes metadata, auth config, endpoint definitions, and a webhook handler through `sdk.Connector`. | `sdk/connector.go` |
+| FR2 | The gateway lists the connector catalog and installs a connector instance via OAuth2 (random `state`, callback, token exchange) or API key. | `gateway/routes_catalog.go` |
+| FR3 | Credentials are encrypted with AES-256-GCM (random nonce per value) before being written to SQLite. | `gateway/db.go` |
+| FR4 | Executing an endpoint loads the instance and decrypted credentials, builds an HTTP client with a token-refresh hook, and runs the endpoint under a 30-second timeout. | `gateway/routes_v1.go` |
+| FR5 | The HTTP client retries transient failures with exponential backoff and jitter, and honors Slack `Retry-After` and GitHub `X-RateLimit-*` headers. | `sdk/client.go` |
+| FR6 | Errors are classified as transient or permanent and recorded in metrics. | `sdk/errors.go` |
+| FR7 | Inbound webhooks at `/webhooks/{instance_id}` are passed to the connector, which verifies the HMAC-SHA256 signature; failures return `401` and are counted. | `gateway/routes_webhook.go`, `sdk/webhook.go` |
+| FR8 | At install, a baseline of the response shape is stored per instance. | `gateway/routes_catalog.go` |
+| FR9 | A background worker polls every 30 seconds, diffs live response shape against the baseline, and posts an alert to `CONDUIT_ALERT_WEBHOOK_URL` if configured. | `gateway/drift.go` |
+| FR10 | `/openapi.json` and `/docs` are generated at runtime, using `reflect` on each endpoint's input and output structs. | `gateway/openapi.go` |
+| FR11 | `/metrics` exposes Prometheus metrics. | `gateway/metrics.go` |
+| FR12 | A dashboard at `/ui/` supports catalog, install, instance management, and endpoint execution. | `ui/` |
+| FR13 | `conduit-scaffold` generates a connector skeleton from an OpenAPI 3.x JSON spec. | `cmd/conduit-scaffold` |
 
 ## 5. Non-Functional Requirements
 
-- **Latency**: Gateway routing overhead should stay under 10ms p99, excluding model inference time.
-- **Availability**: Gateway should tolerate a single node failure without dropping requests (K8s replica sets).
-- **Scalability**: Support 10+ tenants and horizontal scaling of gateway replicas independent of the Flink job.
-- **Observability**: All rollback/drift-flag events must be logged and queryable for post-hoc review.
+- **Security**: Credentials are encrypted at rest. With `CONDUIT_ENV=production`, startup fails unless `CONDUIT_ENCRYPTION_KEY` is exactly 32 bytes.
+- **Resilience**: Outbound calls respect provider rate limits and back off on transient errors. Execution is bounded by a 30-second timeout and webhook handling by a 10-second timeout.
+- **Operability**: The service is a single static binary with an embedded SQLite file (pure-Go driver, no CGO), shipped as a distroless Docker image.
+- **Observability**: Request latency, request errors, token refreshes, webhook failures, and drift detections are exported as Prometheus metrics.
+- **Extensibility**: Adding a connector means implementing `sdk.Connector` and registering it in `NewGateway`.
 
 ## 6. Architecture Summary
 
 ```mermaid
-flowchart TD
-    Client([Client]) --> Gateway["Fleet Gateway (Go)"]
-    Gateway --> ModelServer["Model Server (BentoML)"]
-    ModelServer --> Gateway
-
-    Gateway -->|"request/response events"| Kafka[("Apache Kafka")]
-    Kafka --> Flink["PyFlink Job\n(rolling error/latency windows)"]
-    Flink --> Feast[("Feast\nOnline Store")]
-    Feast -->|"canary promote/rollback decision"| Gateway
-
-    Gateway -->|"per-tenant limits"| Redis[("Redis\nRate Limiting")]
-    Gateway -->|"per-request cost"| Postgres[("PostgreSQL\nCost Attribution")]
-
-    Airflow["Airflow\n(nightly DAG)"] --> Evidently["Evidently AI\nDrift Detection"]
-    Evidently -->|"flags degrading\ntenant-model pairs"| Gateway
-
-    MLflow[("MLflow\nModel Registry")] -.->|"tracks versions"| ModelServer
-
-    classDef gateway fill:#2563eb,stroke:#1e3a8a,color:#fff
-    classDef stream fill:#7c3aed,stroke:#4c1d95,color:#fff
-    classDef store fill:#059669,stroke:#065f46,color:#fff
-    classDef batch fill:#d97706,stroke:#92400e,color:#fff
-
-    class Gateway gateway
-    class Kafka,Flink stream
-    class Feast,Redis,Postgres,MLflow store
-    class Airflow,Evidently batch
+flowchart LR
+    UI[Dashboard UI] -->|REST| Routes[Gateway routes]
+    Routes -->|lookup by ID| Registry[Connectors<br/>slack / github / stripe]
+    Registry -->|Execute| Client[SDK HTTPClient<br/>retry, backoff, refresh]
+    Client -->|HTTP| Provider[Provider APIs<br/>mock server]
+    Routes -->|instances, creds| DB[(SQLite<br/>AES-256-GCM)]
+    Drift[Drift detector<br/>30s ticker] --> DB
+    Drift -->|probe endpoint| Registry
+    Routes --> OpenAPI[OpenAPI + Swagger]
+    OpenAPI -.->|reflect on Endpoints| Registry
 ```
 
 ## 7. Tech Stack
 
-Go (gateway, Kafka producer/consumer, Redis rate limiting, Postgres cost attribution, Feast client calls), Apache Kafka, PyFlink, Feast, Redis, MLflow, BentoML, Airflow, Evidently AI, Docker, Kubernetes.
+Go, `net/http`, SQLite (`modernc.org/sqlite`), Prometheus client, OpenAPI 3.x with Swagger UI, AES-256-GCM (`crypto/aes`, `crypto/cipher`), Docker.
 
-## 8. Success Metrics
+## 8. Verification
 
-- Canary rollback triggers within the configured rolling window (target: under 2 minutes from degradation onset).
-- Drift detection flags surfaced within 24 hours of onset (nightly batch cadence).
-- Zero cross-tenant rate-limit breaches under load testing.
-- Cost attribution accuracy validated against actual per-tenant compute usage.
+- `go test ./...` covers the SDK client, pagination, and webhooks, the Stripe connector, the gateway, the mock server, and the scaffolder.
+- The mock provider lets the full install, execute, webhook, and drift flow run locally with no external accounts.
 
-## 9. Risks / Open Questions
+## 9. Known Gaps and Open Questions
 
-- PyFlink job state size at higher tenant/model counts — may need windowed state TTL tuning.
-- Cold-start latency for newly onboarded tenants before rolling windows have enough data.
-- Whether canary rollback should be fully automatic or require human approval above a severity threshold.
+- Connectors currently build their OAuth and API URLs from the mock host. Making provider base URLs configurable is required before targeting live APIs.
+- Drift probe requests are built per connector inside the drift worker (Slack and GitHub today). Moving probe construction into the connector interface would remove that coupling and cover Stripe.
+- State lives in one SQLite file and pending OAuth states are held in memory, so the gateway is single-node and a restart interrupts in-flight installs.
+- The gateway API has no caller authentication yet.
+- The Slack and GitHub connectors have no dedicated tests.
