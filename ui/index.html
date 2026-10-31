@@ -3,11 +3,11 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Conduit — Integration Gateway</title>
+  <title>Conduit · Integration gateway</title>
   <meta name="description" content="Conduit is an integration gateway for building, distributing, and monitoring SaaS connector instances." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/ui/app.css" />
 </head>
 <body>
@@ -59,11 +59,10 @@
     </nav>
     <div class="sidebar-footer">
       <a href="/docs" target="_blank" class="footer-link">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:13px;height:13px;vertical-align:-2px;margin-right:5px;">
-          <path d="M2 2h5v2H4v8h8v-3h2v5H2z"/>
-          <path d="M9 2h5v5h-2V5.4L7.4 10 6 8.6 10.6 4H9z"/>
+        <svg class="footer-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
         </svg>
-        OpenAPI Spec
+        OpenAPI spec
       </a>
     </div>
   </aside>
@@ -72,10 +71,11 @@
   <main class="main-content">
     <!-- Top Bar -->
     <header class="topbar">
-      <div class="topbar-title" id="view-title">Integration Catalog</div>
+      <div class="topbar-title" id="view-title">Integration catalog</div>
       <div class="topbar-actions">
-        <div class="status-pill" id="gateway-status">
-          <span class="pulse"></span> Gateway Online
+        <div class="gateway-status" id="gateway-status">
+          <span class="status-dot"></span>
+          <span id="gateway-status-text">Checking gateway</span>
         </div>
       </div>
     </header>
@@ -86,7 +86,7 @@
     <!-- ── View: Catalog ── -->
     <section class="view active" id="view-catalog">
       <div class="section-header">
-        <h1>Available Integrations</h1>
+        <h1>Available integrations</h1>
         <p>Browse and install connectors to link your services.</p>
       </div>
       <div class="cards-grid" id="catalog-grid">
@@ -99,7 +99,7 @@
     <!-- ── View: Instances ── -->
     <section class="view" id="view-instances">
       <div class="section-header">
-        <h1>Installed Instances</h1>
+        <h1>Installed instances</h1>
         <p>Manage active connector instances and monitor drift status.</p>
       </div>
       <div id="instances-list" class="instances-list">
@@ -110,34 +110,36 @@
     <!-- ── View: Execute ── -->
     <section class="view" id="view-execute">
       <div class="section-header">
-        <h1>Execute Endpoint</h1>
+        <h1>Execute endpoint</h1>
         <p>Send requests to connector endpoints and inspect the response.</p>
       </div>
-      <div class="execute-panel">
-        <div class="form-group">
-          <label for="exec-instance">Instance</label>
-          <select id="exec-instance" class="form-select"></select>
+      <div class="execute-layout">
+        <div class="execute-panel">
+          <div class="form-group">
+            <label for="exec-instance">Instance</label>
+            <select id="exec-instance" class="form-select"></select>
+          </div>
+          <div class="form-group">
+            <label for="exec-endpoint">Endpoint</label>
+            <select id="exec-endpoint" class="form-select"></select>
+          </div>
+          <div class="form-group">
+            <label for="exec-body">Request body <span class="label-hint">JSON</span></label>
+            <textarea id="exec-body" class="form-textarea" rows="10" placeholder='{"channel": "C123", "text": "Hello"}'></textarea>
+          </div>
+          <button class="btn btn-primary" id="exec-btn" onclick="executeEndpoint()">
+            <svg class="btn-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polygon points="4,2.5 13,8 4,13.5"/>
+            </svg>
+            <span id="exec-btn-label">Execute</span>
+          </button>
         </div>
-        <div class="form-group">
-          <label for="exec-endpoint">Endpoint</label>
-          <select id="exec-endpoint" class="form-select"></select>
-        </div>
-        <div class="form-group">
-          <label for="exec-body">Request Body (JSON)</label>
-          <textarea id="exec-body" class="form-textarea" rows="8" placeholder='{"channel": "C123", "text": "Hello!"}'></textarea>
-        </div>
-        <button class="btn btn-primary" id="exec-btn" onclick="executeEndpoint()">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px;" aria-hidden="true">
-            <polygon points="3,2 14,8 3,14"/>
-          </svg>
-          Execute
-        </button>
-        <div class="response-box" id="response-box" style="display:none">
+        <div class="response-box" id="response-box">
           <div class="response-header">
             <span>Response</span>
             <span class="response-status" id="response-status"></span>
           </div>
-          <pre id="response-body" class="response-body"></pre>
+          <pre id="response-body" class="response-body is-empty">Send a request to see the response here</pre>
         </div>
       </div>
     </section>
@@ -150,30 +152,29 @@
       </div>
       <div class="metrics-panel">
         <div class="metric-card">
-          <div class="metric-label">Prometheus Endpoint</div>
+          <div class="metric-label">Active instances</div>
+          <div class="metric-value metric-value--figure" id="metric-instances-count">0</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Drift detector</div>
+          <div class="metric-value" id="metric-drift-status">Runs every 30s</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Prometheus endpoint</div>
           <div class="metric-value">
             <a href="/metrics" target="_blank" class="metric-link">/metrics ↗</a>
           </div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">OpenAPI Spec</div>
-          <div class="metric-value" style="display:flex; align-items:center; gap:0.5rem; flex-wrap:wrap;">
-            <a href="/docs" target="_blank" class="metric-link">Interactive Docs ↗</a>
-            <span style="color:var(--text-muted); font-size:0.9rem;">|</span>
-            <a href="/openapi.json" target="_blank" class="metric-link" style="color:var(--text-secondary); font-size:0.9rem;">Raw JSON ↗</a>
+          <div class="metric-label">OpenAPI spec</div>
+          <div class="metric-value">
+            <a href="/docs" target="_blank" class="metric-link">Interactive docs ↗</a>
+            <a href="/openapi.json" target="_blank" class="metric-link metric-link--quiet">Raw JSON ↗</a>
           </div>
         </div>
-        <div class="metric-card">
-          <div class="metric-label">Drift Detector</div>
-          <div class="metric-value" id="metric-drift-status">Runs every 30s</div>
-        </div>
-        <div class="metric-card">
-          <div class="metric-label">Active Instances</div>
-          <div class="metric-value" id="metric-instances-count">—</div>
-        </div>
       </div>
-      <div class="section-header" style="margin-top:2rem">
-        <h2>Tracked Metrics</h2>
+      <div class="section-header section-header--sub">
+        <h2>Tracked metrics</h2>
       </div>
       <div class="metrics-table-wrapper">
         <table class="metrics-table">
@@ -196,9 +197,9 @@
   <div class="modal-backdrop" id="install-modal" style="display:none">
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
       <div class="modal-header">
-        <h2 id="modal-title">Install Connector</h2>
+        <h2 id="modal-title">Install connector</h2>
         <button class="modal-close" onclick="closeInstallModal()" aria-label="Close">
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="width:16px;height:16px;" aria-hidden="true">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
             <line x1="2" y1="2" x2="14" y2="14"/><line x1="14" y1="2" x2="2" y2="14"/>
           </svg>
         </button>

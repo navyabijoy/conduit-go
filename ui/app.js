@@ -19,16 +19,16 @@
  * @property {string} status
  */
 
-/** @typedef {{ abbr: string, color: string }} ConnectorMeta */
+/** @typedef {{ abbr: string }} ConnectorMeta */
 
 const API = '';   // Same origin — no base URL prefix needed
 
-// ─── Connector meta (initials + accent colour) ───────────────────────────────
+// ─── Connector meta (initials shown in the neutral connector tile) ───────────
 /** @type {Record<string, ConnectorMeta>} */
 const CONNECTOR_META = {
-  slack:  { abbr: 'SL', color: '#E01E5A' },
-  github: { abbr: 'GH', color: '#24292F' },
-  stripe: { abbr: 'ST', color: '#635BFF' },
+  slack:  { abbr: 'SL' },
+  github: { abbr: 'GH' },
+  stripe: { abbr: 'ST' },
 };
 
 /**
@@ -36,22 +36,19 @@ const CONNECTOR_META = {
  * @returns {ConnectorMeta}
  */
 function connMeta(id) {
-  const abbr = id ? id.slice(0, 2).toUpperCase() : '??';
-  return CONNECTOR_META[id] || { abbr, color: '#2563EB' };
+  return CONNECTOR_META[id] || { abbr: id ? id.slice(0, 2).toUpperCase() : '??' };
 }
 
-/** Applies a per-item entrance-animation stagger delay so lists feel choreographed rather than instant. */
-function applyStagger(container) {
-  Array.from(container.children).forEach((child, i) => {
-    child.style.setProperty('--stagger-delay', `${Math.min(i, 8) * 40}ms`);
-  });
+/** Escapes text for safe interpolation into innerHTML. @param {unknown} v */
+function esc(v) {
+  return String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
 // ─── Navigation ──────────────────────────────────────────────────────────────
 const VIEW_TITLES = {
-  catalog:   'Integration Catalog',
-  instances: 'Installed Instances',
-  execute:   'Execute Endpoint',
+  catalog:   'Integration catalog',
+  instances: 'Installed instances',
+  execute:   'Execute endpoint',
   metrics:   'Observability',
 };
 
@@ -97,7 +94,6 @@ async function loadCatalog() {
     for (const conn of connectors) {
       grid.appendChild(buildConnectorCard(conn));
     }
-    applyStagger(grid);
   } catch (err) {
     grid.innerHTML = `<div class="empty-state">Failed to load catalog: ${err.message}</div>`;
   }
@@ -109,23 +105,28 @@ function buildConnectorCard(conn) {
   const card = el('div', 'connector-card');
 
   const scopes = (conn.scopes || []).slice(0, 4)
-    .map(s => `<span class="scope-pill">${s}</span>`)
+    .map(s => `<span class="scope">${esc(s)}</span>`)
     .join('');
 
   card.innerHTML = `
     <div class="card-header">
-      <span class="card-icon" style="background:${meta.color}">${meta.abbr}</span>
-      <span class="card-category">${conn.category || 'Integration'}</span>
+      <span class="card-icon" aria-hidden="true">${esc(meta.abbr)}</span>
+      <div class="card-title">
+        <span class="card-name">${esc(conn.name)}</span>
+        <span class="card-category">${esc(conn.category || 'Integration')}</span>
+      </div>
     </div>
-    <div class="card-name">${conn.name}</div>
-    <div class="card-desc">${conn.description || ''}</div>
-    ${scopes ? `<div class="card-scopes">${scopes}</div>` : ''}
+    <div class="card-desc">${esc(conn.description)}</div>
+    <div class="card-footer">
+      ${scopes ? `<div class="card-scopes">${scopes}</div>` : '<span class="card-auth">API key</span>'}
+    </div>
   `;
 
-  const installBtn = el('button', 'btn btn-primary btn-sm');
+  const installBtn = el('button', 'btn btn-secondary btn-sm');
   installBtn.textContent = 'Install';
+  installBtn.setAttribute('aria-label', `Install ${conn.name}`);
   installBtn.onclick = () => openInstallModal(conn);
-  card.appendChild(installBtn);
+  card.querySelector('.card-footer').appendChild(installBtn);
 
   return card;
 }
@@ -140,7 +141,6 @@ let _preModalFocus = null;
 function openInstallModal(conn) {
   _installing = conn;
   _preModalFocus = /** @type {HTMLElement} */ (document.activeElement);
-  const meta = connMeta(conn.id);
   const modal = document.getElementById('install-modal');
   const body  = document.getElementById('modal-body');
   document.getElementById('modal-title').textContent = `Install ${conn.name}`;
@@ -151,7 +151,7 @@ function openInstallModal(conn) {
     body.innerHTML = `
       <p><strong>${conn.name}</strong> uses an <strong>API key</strong> for authentication.</p>
       <div class="form-group">
-        <label for="modal-api-key">API Key</label>
+        <label for="modal-api-key">API key</label>
         <input id="modal-api-key" class="form-input" type="password" placeholder="sk_live_..." autocomplete="off" />
       </div>
       <div class="modal-actions">
@@ -162,7 +162,8 @@ function openInstallModal(conn) {
   } else {
     body.innerHTML = `
       <p><strong>${conn.name}</strong> uses <strong>OAuth 2.0</strong>. You'll be redirected to the provider to authorise access.</p>
-      <p>Requested scopes: <strong>${(conn.scopes || []).join(', ')}</strong></p>
+      <p>Requested scopes</p>
+      <div class="modal-scopes">${(conn.scopes || []).map(s => `<span class="scope">${esc(s)}</span>`).join('')}</div>
       <div class="modal-actions">
         <button class="btn btn-secondary" onclick="closeInstallModal()">Cancel</button>
         <button class="btn btn-primary" onclick="installOAuth('${conn.id}')">Authorise &rarr;</button>
@@ -238,7 +239,7 @@ async function installAPIKey(connectorID) {
       body: JSON.stringify({ api_key: key }),
     });
     closeInstallModal();
-    toast(`${connectorID} installed! Instance: ${result.instance_id}`, 'success');
+    toast(`${connectorID} installed as ${result.instance_id}`, 'success');
     switchView('instances');
   } catch (err) {
     toast('Install failed: ' + err.message, 'error');
@@ -264,7 +265,6 @@ async function loadInstances() {
     for (const inst of instances) {
       list.appendChild(buildInstanceRow(inst));
     }
-    applyStagger(list);
   } catch (err) {
     list.innerHTML = `<div class="empty-state">Failed to load instances: ${err.message}</div>`;
   }
@@ -273,16 +273,16 @@ async function loadInstances() {
 /** @param {Instance} inst */
 function buildInstanceRow(inst) {
   const meta = connMeta(inst.connector_id);
-  const statusClass = `status-${inst.status}`;
+  const statusClass = `status-${esc(inst.status)}`;
 
   const row = el('div', 'instance-row');
   row.innerHTML = `
-    <span class="instance-icon" style="background:${meta.color}">${meta.abbr}</span>
+    <span class="instance-icon" aria-hidden="true">${esc(meta.abbr)}</span>
     <div class="instance-info">
-      <div class="instance-connector">${inst.connector_id}</div>
-      <div class="instance-id">${inst.id}</div>
+      <div class="instance-connector">${esc(inst.connector_id)}</div>
+      <div class="instance-id">${esc(inst.id)}</div>
     </div>
-    <span class="status-badge ${statusClass}">${inst.status}</span>
+    <span class="status ${statusClass}"><span class="status-dot"></span>${esc(inst.status)}</span>
     <div class="instance-actions">
       <button class="btn btn-secondary btn-sm" onclick="quickExecute('${inst.id}', '${inst.connector_id}')">Execute</button>
       <button class="btn btn-danger btn-sm" onclick="deleteInstance('${inst.id}')">Remove</button>
@@ -330,7 +330,7 @@ const ENDPOINTS = {
 
 // Default bodies for each endpoint
 const DEFAULT_BODIES = {
-  send_message:  JSON.stringify({ channel: 'C_GENERAL', text: 'Hello from Conduit!' }, null, 2),
+  send_message:  JSON.stringify({ channel: 'C_GENERAL', text: 'Hello from Conduit' }, null, 2),
   create_issue:  JSON.stringify({ owner: 'my-org', repo: 'my-repo', title: 'New issue from Conduit', body: 'Auto-created.' }, null, 2),
   list_issues:   JSON.stringify({}, null, 2),
   list_charges:  JSON.stringify({}, null, 2),
@@ -343,7 +343,7 @@ async function loadExecuteSelects() {
   try {
     const instances = await apiFetch('/v1/instances');
     instSel.innerHTML = instances?.length
-      ? instances.map(i => `<option value="${i.id}" data-connector="${i.connector_id}">${i.connector_id} — ${i.id}</option>`).join('')
+      ? instances.map(i => `<option value="${i.id}" data-connector="${i.connector_id}">${i.connector_id} · ${i.id}</option>`).join('')
       : '<option value="">No instances available</option>';
 
     instSel.onchange = () => {
@@ -378,10 +378,10 @@ async function executeEndpoint() {
   }
 
   const btn = document.getElementById('exec-btn');
-  btn.textContent = 'Executing…';
+  const btnLabel = document.getElementById('exec-btn-label');
+  btnLabel.textContent = 'Executing…';
   btn.disabled = true;
 
-  const responseBox    = document.getElementById('response-box');
   const responseStatus = document.getElementById('response-status');
   const responseBody   = document.getElementById('response-body');
 
@@ -403,8 +403,8 @@ async function executeEndpoint() {
 
     responseStatus.textContent = `${raw.status} ${raw.statusText}`;
     responseStatus.className = 'response-status ' + (raw.ok ? 'ok' : 'err');
-    responseBody.textContent = formatted;
-    responseBox.style.display = '';
+    responseBody.classList.remove('is-empty');
+    responseBody.innerHTML = highlightJSON(formatted);
 
     if (raw.ok) {
       toast(`${endpointName} executed successfully (${raw.status})`, 'success');
@@ -414,9 +414,25 @@ async function executeEndpoint() {
   } catch (err) {
     toast('Request failed: ' + err.message, 'error');
   } finally {
-    btn.textContent = 'Execute';
+    btnLabel.textContent = 'Execute';
     btn.disabled = false;
   }
+}
+
+/**
+ * Escapes a formatted JSON string and wraps keys, strings, numbers and
+ * literals in spans for the response viewer. Non-JSON text is only escaped.
+ * @param {string} text
+ */
+function highlightJSON(text) {
+  return esc(text).replace(
+    /(&quot;(?:[^&]|&(?!quot;))*?&quot;)(\s*:)?|\b(true|false|null)\b|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)|([{}\[\],])/g,
+    (m, str, colon, lit, num, punc) => {
+      if (str) return colon ? `<span class="j-key">${str}</span><span class="j-punc">${colon}</span>` : `<span class="j-str">${str}</span>`;
+      if (lit) return `<span class="j-lit">${lit}</span>`;
+      if (num) return `<span class="j-num">${num}</span>`;
+      return `<span class="j-punc">${punc}</span>`;
+    });
 }
 
 // ─── Metrics Summary ──────────────────────────────────────────────────────────
@@ -460,14 +476,23 @@ function toast(message, type = 'info') {
   setTimeout(() => t.remove(), 4000);
 }
 
+/** @param {boolean} online */
+function setGatewayStatus(online) {
+  document.getElementById('gateway-status').className = `gateway-status ${online ? 'online' : 'offline'}`;
+  document.getElementById('gateway-status-text').textContent = online ? 'Gateway online' : 'Gateway unreachable';
+}
+
 // ─── Init ─────────────────────────────────────────────────────────────────────
 (async function init() {
   // Load catalog by default
   loadCatalog();
 
-  // Warm up the badge
+  // Warm up the badge; this call doubles as the gateway health check.
   try {
     const instances = await apiFetch('/v1/instances');
     updateBadge(instances?.length || 0);
-  } catch {}
+    setGatewayStatus(true);
+  } catch {
+    setGatewayStatus(false);
+  }
 })();

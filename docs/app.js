@@ -1,86 +1,88 @@
 /**
- * Conduit landing page: terminal typewriter, copy-to-clipboard, scroll reveal.
+ * Conduit landing page: hero terminal playback and copy-to-clipboard.
  * No build step, no dependencies.
  */
 
 const REDUCED_MOTION = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-/** @type {Array<{text: string, cls?: string}>} Lines rendered into the hero terminal. */
-const TERMINAL_LINES = [
-  { text: '$ docker run -p 8080:8080 -p 8081:8081 conduit', cls: 'prompt' },
-  { text: '[Gateway] Starting API Gateway on :8080' },
-  { text: '[Mock Server] Starting on :8081' },
-  { text: '[Gateway] GET /v1/connectors - 76µs' },
-  { text: '' },
-  { text: '$ curl localhost:8080/v1/connectors', cls: 'prompt' },
-  { text: '[{"id":"slack",...},{"id":"github",...},{"id":"stripe",...}]' },
+/**
+ * Gateway session shown in the hero terminal. Log lines mirror the real
+ * log.Printf formats in gateway/server.go, gateway/drift.go and
+ * mock/mock_server.go, so the page only shows what the binary prints.
+ *
+ * A line is either a typed command ({ cmd }), a blank spacer ({ gap: true }),
+ * or a log line ({ t, tag, parts }) where parts are [text, className?] pairs.
+ * @type {Array<{cmd?: string, gap?: boolean, t?: string, tag?: string, parts?: Array<[string, string?]>, pause?: number}>}
+ */
+const SESSION = [
+  { cmd: 'docker run -p 8080:8080 -p 8081:8081 conduit' },
+  { t: '14:02:07', tag: '[Gateway]', parts: [['Starting API Gateway on :8080']] },
+  { t: '14:02:07', tag: '[Mock Server]', parts: [['Starting on :8081']], pause: 500 },
+  { gap: true },
+  { t: '14:02:11', tag: '[Gateway]', parts: [['Executing slack.send_message for instance inst_slack_9f3a1c2e7b04d815']] },
+  { t: '14:02:11', tag: '[Gateway]', parts: [['Refreshing OAuth token', 'hl-accent'], [' for instance inst_slack_9f3a1c2e7b04d815']], pause: 420 },
+  { t: '14:02:12', tag: '[Gateway]', parts: [['Token refreshed successfully', 'hl-ok'], [' for instance inst_slack_9f3a1c2e7b04d815']], pause: 700 },
+  { gap: true },
+  { t: '14:02:37', tag: '[Drift Detector]', parts: [['Scanning instance inst_github_3c07e5a1d29b6f40 (github) for schema drift...']], pause: 600 },
+  { t: '14:02:37', tag: '[DRIFT DETECTED]', tagCls: 'hl-alert', parts: [['Instance inst_github_3c07e5a1d29b6f40 (github) has drifted! Details: Field ".[].state" removed']] },
 ];
 
-/** Types the hero terminal lines one character at a time; skips straight to full text under reduced motion. */
-async function typeTerminal() {
-  const el = document.getElementById('terminal-code');
-  if (!el) return;
+/** @param {string} text @param {string} [cls] */
+function span(text, cls) {
+  const el = document.createElement('span');
+  if (cls) el.className = cls;
+  el.textContent = text;
+  return el;
+}
 
-  if (REDUCED_MOTION) {
-    el.textContent = TERMINAL_LINES.map(l => l.text).join('\n');
-    return;
+/** Builds one terminal line element; commands start empty so they can be typed. */
+function buildLine(line) {
+  const el = document.createElement('span');
+  if (line.gap) {
+    el.className = 'line gap';
+    return { el };
   }
+  if (line.cmd !== undefined) {
+    el.className = 'line cmd';
+    el.append(span('$ ', 'ps'));
+    const text = span('');
+    el.append(text);
+    return { el, text };
+  }
+  el.className = 'line';
+  el.append(span(line.t + ' ', 't'), span(line.tag, line.tagCls || 'tag'), ' ');
+  for (const [text, cls] of line.parts) el.append(cls ? span(text, cls) : text);
+  return { el };
+}
 
-  // <code> only permits inline (phrasing) content per the HTML spec; using
-  // block-level <div> lines here caused browsers to split it into anonymous
-  // inline box fragments, which rendered as a stray glyph at the boundary.
-  // <span> + a literal "\n" text node (preserved by white-space: pre-wrap)
-  // stays inline-legal and avoids that.
-  for (const [i, line] of TERMINAL_LINES.entries()) {
-    const lineSpan = document.createElement('span');
-    if (line.cls) lineSpan.className = line.cls;
-    el.appendChild(lineSpan);
+/** Plays the session: commands type out, log lines arrive one at a time. */
+async function playTerminal() {
+  const root = document.getElementById('terminal-code');
+  if (!root) return;
 
-    for (const char of line.text) {
-      lineSpan.textContent += char;
-      await sleep(line.cls === 'prompt' ? 22 : 4);
+  for (const line of SESSION) {
+    const { el, text } = buildLine(line);
+    if (REDUCED_MOTION) {
+      if (text) text.textContent = line.cmd;
+      root.append(el);
+      continue;
     }
-    if (i < TERMINAL_LINES.length - 1) el.appendChild(document.createTextNode('\n'));
-    await sleep(120);
+    root.append(el);
+    if (text) {
+      for (const char of line.cmd) {
+        text.textContent += char;
+        await sleep(24);
+      }
+      await sleep(400);
+    } else if (!line.gap) {
+      await sleep(line.pause ?? 160);
+    }
   }
 }
 
 /** @param {number} ms */
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-/**
- * Fades feature cards in as they enter the viewport. Cards are visible by
- * default (see style.css); this only opts cards currently below the fold
- * into a hidden-then-reveal state, so a card can never end up permanently
- * invisible if IntersectionObserver doesn't fire for it.
- */
-function initScrollReveal() {
-  const cards = document.querySelectorAll('.feature-card');
-  if (REDUCED_MOTION || !('IntersectionObserver' in window)) return;
-
-  const reveal = card => {
-    card.classList.add('in-view');
-    card.classList.remove('pre-reveal');
-    observer.unobserve(card);
-  };
-
-  const observer = new IntersectionObserver(entries => {
-    entries.forEach(entry => { if (entry.isIntersecting) reveal(entry.target); });
-  }, { threshold: 0.15 });
-
-  cards.forEach((card, i) => {
-    if (card.getBoundingClientRect().top > window.innerHeight) {
-      card.classList.add('pre-reveal');
-      card.style.animationDelay = `${(i % 6) * 60}ms`;
-      observer.observe(card);
-      // Safety net: guarantee visibility even if IntersectionObserver never
-      // fires for this card (e.g. a full-page capture tool that resizes the
-      // viewport without dispatching a scroll/layout event in time).
-      setTimeout(() => reveal(card), 1200);
-    }
-  });
 }
 
 function initCopyButton() {
@@ -91,7 +93,7 @@ function initCopyButton() {
   btn.addEventListener('click', async () => {
     try {
       await navigator.clipboard.writeText(code.textContent.trim());
-      btn.textContent = 'Copied!';
+      btn.textContent = 'Copied';
     } catch {
       btn.textContent = 'Press ⌘C to copy';
     }
@@ -99,6 +101,5 @@ function initCopyButton() {
   });
 }
 
-typeTerminal();
-initScrollReveal();
+playTerminal();
 initCopyButton();
