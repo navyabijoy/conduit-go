@@ -4,10 +4,15 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"strings"
 )
 
-// VerifyHMACSHA256 checks if the hex signature matches the HMAC-SHA256 signature of the payload.
+// VerifyHMACSHA256 reports whether signature is the hex HMAC-SHA256 of payload under
+// secret. An empty secret never verifies, so an unconfigured instance rejects everything.
 func VerifyHMACSHA256(payload []byte, signature string, secret []byte) bool {
+	if len(secret) == 0 {
+		return false
+	}
 	mac := hmac.New(sha256.New, secret)
 	mac.Write(payload)
 	expectedMAC := mac.Sum(nil)
@@ -18,11 +23,8 @@ func VerifyHMACSHA256(payload []byte, signature string, secret []byte) bool {
 	return hmac.Equal(actualMAC, expectedMAC)
 }
 
-// VerifyHMACSHA256HexSignature validates a signature that might contain a prefix (e.g. "sha256=").
+// VerifyHMACSHA256HexSignature does the same for headers that prefix the digest,
+// like GitHub's "sha256=".
 func VerifyHMACSHA256HexSignature(payload []byte, signatureHeader string, prefix string, secret []byte) bool {
-	sig := signatureHeader
-	if len(prefix) > 0 && len(sig) > len(prefix) && sig[:len(prefix)] == prefix {
-		sig = sig[len(prefix):]
-	}
-	return VerifyHMACSHA256(payload, sig, secret)
+	return VerifyHMACSHA256(payload, strings.TrimPrefix(signatureHeader, prefix), secret)
 }
