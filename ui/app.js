@@ -95,7 +95,7 @@ async function loadCatalog() {
       grid.appendChild(buildConnectorCard(conn));
     }
   } catch (err) {
-    grid.innerHTML = `<div class="empty-state">Failed to load catalog: ${err.message}</div>`;
+    grid.innerHTML = `<div class="empty-state">Failed to load catalog: ${esc(err.message)}</div>`;
   }
 }
 
@@ -266,7 +266,7 @@ async function loadInstances() {
       list.appendChild(buildInstanceRow(inst));
     }
   } catch (err) {
-    list.innerHTML = `<div class="empty-state">Failed to load instances: ${err.message}</div>`;
+    list.innerHTML = `<div class="empty-state">Failed to load instances: ${esc(err.message)}</div>`;
   }
 }
 
@@ -471,7 +471,10 @@ const TOAST_ICONS = {
 function toast(message, type = 'info') {
   const container = document.getElementById('toast-container');
   const t = el('div', `toast toast-${type}`);
-  t.innerHTML = `${TOAST_ICONS[type] || TOAST_ICONS.info}<span>${message}</span>`;
+  t.innerHTML = TOAST_ICONS[type] || TOAST_ICONS.info;
+  const text = document.createElement('span');
+  text.textContent = message;
+  t.appendChild(text);
   container.appendChild(t);
   setTimeout(() => t.remove(), 4000);
 }
