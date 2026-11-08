@@ -1,7 +1,6 @@
 package stripe_test
 
 import (
-	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,15 +16,15 @@ import (
 
 const webhookSecret = "mock_webhook_secret_value"
 
-func newTestServer() (*mock.MockServer, *httptest.Server, string) {
-	ms := mock.NewMockServer("", webhookSecret)
+func newTestServer() (*mock.Server, *httptest.Server, string) {
+	ms := mock.NewServer("", webhookSecret)
 	ts := httptest.NewServer(ms.Handler())
 	host := ts.Listener.Addr().String()
 	return ms, ts, host
 }
 
 func TestStripeMetadata(t *testing.T) {
-	conn := stripe.NewStripeConnector("")
+	conn := stripe.New()
 	meta := conn.Metadata()
 	if meta.ID != "stripe" {
 		t.Errorf("want id=stripe, got %q", meta.ID)
@@ -42,7 +41,7 @@ func TestStripeListCharges(t *testing.T) {
 	_, ts, host := newTestServer()
 	defer ts.Close()
 
-	conn := stripe.NewStripeConnector(host)
+	conn := stripe.New()
 	creds := sdk.Credentials{APIKey: "sk_test_mock_key_12345"}
 	client := sdk.NewHTTPClient("http://"+host, creds, conn.AuthConfig(), nil)
 
@@ -91,7 +90,7 @@ func TestStripeListCharges_Pagination(t *testing.T) {
 	_, ts, host := newTestServer()
 	defer ts.Close()
 
-	conn := stripe.NewStripeConnector(host)
+	conn := stripe.New()
 	creds := sdk.Credentials{APIKey: "sk_test_mock_key_12345"}
 	client := sdk.NewHTTPClient("http://"+host, creds, conn.AuthConfig(), nil)
 
@@ -104,7 +103,6 @@ func TestStripeListCharges_Pagination(t *testing.T) {
 		}
 	}
 
-	// Second page — pass starting_after
 	resp, err := listEP.Execute(context.Background(), client, sdk.Request{
 		Params: map[string]string{"starting_after": "ch_page1_3", "limit": "3"},
 	})
@@ -130,8 +128,8 @@ func TestStripeListCharges_Unauthorized(t *testing.T) {
 	_, ts, host := newTestServer()
 	defer ts.Close()
 
-	conn := stripe.NewStripeConnector(host)
-	// Wrong key format (no sk_ prefix)
+	conn := stripe.New()
+	// The mock only accepts keys with Stripe's "sk_" prefix.
 	creds := sdk.Credentials{APIKey: "wrong_key"}
 	client := sdk.NewHTTPClient("http://"+host, creds, conn.AuthConfig(), nil)
 
@@ -151,7 +149,7 @@ func TestStripeListCharges_Unauthorized(t *testing.T) {
 }
 
 func TestStripeWebhookValid(t *testing.T) {
-	conn := stripe.NewStripeConnector("")
+	conn := stripe.New()
 	payload := []byte(`{"type":"charge.succeeded","id":"ch_test_001"}`)
 
 	mac := hmac.New(sha256.New, []byte(webhookSecret))
@@ -161,6 +159,7 @@ func TestStripeWebhookValid(t *testing.T) {
 	event := sdk.WebhookEvent{
 		Payload:   payload,
 		EventType: "charge.succeeded",
+		Secret:    []byte(webhookSecret),
 		Headers: map[string]string{
 			"Stripe-Signature": "t=1234567890," + sig,
 		},
@@ -171,13 +170,36 @@ func TestStripeWebhookValid(t *testing.T) {
 	}
 }
 
+func TestStripeWebhookWrongSecret(t *testing.T) {
+	conn := stripe.New()
+	payload := []byte(`{"type":"charge.succeeded"}`)
+
+	mac := hmac.New(sha256.New, []byte(webhookSecret))
+	mac.Write(payload)
+	sig := "v1=" + hex.EncodeToString(mac.Sum(nil))
+
+	// A valid signature under a different secret must not verify; this fails
+	// if the connector ignores event.Secret and uses a built-in value.
+	for name, secret := range map[string][]byte{"other secret": []byte("another_secret"), "no secret": nil} {
+		event := sdk.WebhookEvent{
+			Payload: payload,
+			Secret:  secret,
+			Headers: map[string]string{"Stripe-Signature": "t=1234567890," + sig},
+		}
+		if err := conn.HandleWebhook(context.Background(), event); err == nil {
+			t.Errorf("%s: expected signature check to fail", name)
+		}
+	}
+}
+
 func TestStripeWebhookInvalidSignature(t *testing.T) {
-	conn := stripe.NewStripeConnector("")
+	conn := stripe.New()
 	payload := []byte(`{"type":"charge.succeeded"}`)
 
 	event := sdk.WebhookEvent{
 		Payload:   payload,
 		EventType: "charge.succeeded",
+		Secret:    []byte(webhookSecret),
 		Headers: map[string]string{
 			"Stripe-Signature": "t=1234567890,v1=badbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadbadb",
 		},
@@ -189,10 +211,10 @@ func TestStripeWebhookInvalidSignature(t *testing.T) {
 }
 
 func TestStripeWebhookMissingHeader(t *testing.T) {
-	conn := stripe.NewStripeConnector("")
+	conn := stripe.New()
 	event := sdk.WebhookEvent{
-		Payload:  []byte(`{}`),
-		Headers:  map[string]string{},
+		Payload: []byte(`{}`),
+		Headers: map[string]string{},
 	}
 	if err := conn.HandleWebhook(context.Background(), event); err == nil {
 		t.Fatal("expected missing header to fail")
@@ -200,11 +222,10 @@ func TestStripeWebhookMissingHeader(t *testing.T) {
 }
 
 func TestStripePaginatorCursorExtract(t *testing.T) {
-	// Verify the paginator signals continuation correctly
 	_, ts, host := newTestServer()
 	defer ts.Close()
 
-	conn := stripe.NewStripeConnector(host)
+	conn := stripe.New()
 	paginator := conn.Endpoints()[0].GetPaginator("/services/stripe/v1/charges", nil, 3)
 	if paginator == nil {
 		t.Fatal("paginator should not be nil")
@@ -216,7 +237,6 @@ func TestStripePaginatorCursorExtract(t *testing.T) {
 	creds := sdk.Credentials{APIKey: "sk_test_mock_key_12345"}
 	client := sdk.NewHTTPClient("http://"+host, creds, conn.AuthConfig(), nil)
 
-	// Fetch page 1
 	page1, err := paginator.Next(context.Background(), client)
 	if err != nil {
 		t.Fatalf("page1: %v", err)
@@ -231,11 +251,7 @@ func TestStripePaginatorCursorExtract(t *testing.T) {
 		t.Fatal("expected data on page 1")
 	}
 
-	// Paginator should still have next
 	if !paginator.HasNext() {
 		t.Error("expected paginator to have more pages after page 1")
 	}
 }
-
-// Ensure the Stripe connector compiles and bytes.Buffer import is used
-var _ = bytes.NewBuffer

@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-func (g *Gateway) handleOpenAPISpec(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleOpenAPISpec(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		writeJSONError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
@@ -21,14 +21,14 @@ func (g *Gateway) handleOpenAPISpec(w http.ResponseWriter, r *http.Request) {
 			"description": "Dynamic SaaS integration framework routing and endpoint specifications.",
 			"version":     "1.0.0",
 		},
-		"paths": g.generatePaths(),
+		"paths": s.generatePaths(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(spec)
 }
 
-func (g *Gateway) handleDocs(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		writeJSONError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
@@ -43,7 +43,8 @@ const swaggerUIHTML = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <title>Conduit API Documentation</title>
-  <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui.css" />
+  <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui.css"
+    integrity="sha384-+yyzNgM3K92sROwsXxYCxaiLWxWJ0G+v/9A+qIZ2rgefKgkdcmJI+L601cqPD/Ut" crossorigin="anonymous" />
   <link rel="icon" type="image/png" href="https://unpkg.com/swagger-ui-dist@5.11.0/favicon-32x32.png" sizes="32x32" />
   <link rel="icon" type="image/png" href="https://unpkg.com/swagger-ui-dist@5.11.0/favicon-16x16.png" sizes="16x16" />
   <style>
@@ -65,8 +66,10 @@ const swaggerUIHTML = `<!DOCTYPE html>
 </head>
 <body>
   <div id="swagger-ui"></div>
-  <script src="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui-bundle.js" charset="UTF-8"></script>
-  <script src="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui-standalone-preset.js" charset="UTF-8"></script>
+  <script src="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui-bundle.js" charset="UTF-8"
+    integrity="sha384-qn5tagrAjZi8cSmvZ+k3zk4+eDEEUcP9myuR2J6V+/H6rne++v6ChO7EeHAEzqxQ" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui-standalone-preset.js" charset="UTF-8"
+    integrity="sha384-SiLF+uYBf9lVQW98s/XUYP14enXJN31bn0zu3BS1WFqr5hvnMF+w132WkE/v0uJw" crossorigin="anonymous"></script>
   <script>
     window.onload = function() {
       const ui = SwaggerUIBundle({
@@ -88,17 +91,15 @@ const swaggerUIHTML = `<!DOCTYPE html>
 </body>
 </html>`
 
-
-func (g *Gateway) generatePaths() map[string]interface{} {
+// generatePaths documents each endpoint as POST /v1/instances/{instance_id}/endpoints/{name}.
+// Endpoints that share a name across connectors overwrite each other.
+func (s *Server) generatePaths() map[string]interface{} {
 	paths := make(map[string]interface{})
 
-	// For each connector type in registry, we define dynamic endpoint routes
-	for connID, conn := range g.registry {
+	for connID, conn := range s.registry {
 		for _, ep := range conn.Endpoints() {
-			// Path shape: /v1/instances/{instance_id}/endpoints/{endpoint_name}
 			routePath := "/v1/instances/{instance_id}/endpoints/" + ep.Name
-			
-			// We group by path
+
 			pathItem, exists := paths[routePath]
 			var methods map[string]interface{}
 			if exists {
@@ -108,7 +109,6 @@ func (g *Gateway) generatePaths() map[string]interface{} {
 				paths[routePath] = methods
 			}
 
-			// Define POST execution details
 			op := map[string]interface{}{
 				"summary":     fmt.Sprintf("Execute %s endpoint: %s", connID, ep.Name),
 				"description": ep.Description,
@@ -125,7 +125,6 @@ func (g *Gateway) generatePaths() map[string]interface{} {
 				},
 			}
 
-			// Add RequestBody schema if InputSchema is set
 			if ep.InputSchema != nil {
 				schema := reflectToOpenAPISchema(ep.InputSchema)
 				if schema != nil {
@@ -140,7 +139,6 @@ func (g *Gateway) generatePaths() map[string]interface{} {
 				}
 			}
 
-			// Add Response schema if OutputSchema is set
 			respContent := map[string]interface{}{}
 			if ep.OutputSchema != nil {
 				schema := reflectToOpenAPISchema(ep.OutputSchema)
@@ -180,7 +178,6 @@ func reflectToOpenAPISchema(val interface{}) map[string]interface{} {
 	}
 
 	t := reflect.TypeOf(val)
-	// Dereference pointer
 	if t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
@@ -188,13 +185,13 @@ func reflectToOpenAPISchema(val interface{}) map[string]interface{} {
 	return reflectTypeToSchema(t)
 }
 
+// reflectTypeToSchema maps Go kinds to OpenAPI types, naming struct fields by json tag.
 func reflectTypeToSchema(t reflect.Type) map[string]interface{} {
 	switch t.Kind() {
 	case reflect.Struct:
 		properties := make(map[string]interface{})
 		for i := 0; i < t.NumField(); i++ {
 			field := t.Field(i)
-			// Get JSON tag name
 			jsonTag := field.Tag.Get("json")
 			fieldName := field.Name
 			if jsonTag != "" {
@@ -241,8 +238,7 @@ func reflectTypeToSchema(t reflect.Type) map[string]interface{} {
 		return map[string]interface{}{"type": "boolean"}
 
 	default:
-		return map[string]interface{}{"type": "string"} // fallback
+		// Maps, interfaces and other kinds have no precise OpenAPI mapping.
+		return map[string]interface{}{"type": "string"}
 	}
 }
-
-

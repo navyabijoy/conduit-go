@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"time"
 
@@ -18,30 +18,36 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// DB stores connector instances and credentials in SQLite, encrypting secrets with AES-256-GCM.
 type DB struct {
-	db            *sql.DB
+	conn          *sql.DB
 	encryptionKey []byte
 }
 
+// ConnectorInstance is one installed connector. BaselineSchema is the response shape
+// captured at install, as JSON.
 type ConnectorInstance struct {
 	ID             string    `json:"id"`
 	ConnectorID    string    `json:"connector_id"`
 	Status         string    `json:"status"` // "active", "drifted", "error"
 	BaselineSchema string    `json:"baseline_schema"`
-	WebhookSecret  string    `json:"webhook_secret"`
 	CreatedAt      time.Time `json:"created_at"`
 }
 
-// NewDB opens or creates the SQLite database and executes migrations.
+// NewDB opens the SQLite file at dbPath and creates missing tables. The encryption key
+// comes from CONDUIT_ENCRYPTION_KEY.
 func NewDB(dbPath string) (*DB, error) {
 	sqlDB, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
 	}
+	// SQLite allows one writer, and every ":memory:" connection would be its own empty
+	// database, so use a single connection.
+	sqlDB.SetMaxOpenConns(1)
 
 	db := &DB{
-		db:            sqlDB,
-		encryptionKey: getEncryptionKey(),
+		conn:          sqlDB,
+		encryptionKey: encryptionKeyFromEnv(),
 	}
 
 	if err := db.migrate(); err != nil {
@@ -52,8 +58,9 @@ func NewDB(dbPath string) (*DB, error) {
 	return db, nil
 }
 
+// Close closes the database.
 func (db *DB) Close() error {
-	return db.db.Close()
+	return db.conn.Close()
 }
 
 func (db *DB) migrate() error {
@@ -63,7 +70,6 @@ func (db *DB) migrate() error {
 			connector_id TEXT NOT NULL,
 			status TEXT NOT NULL,
 			baseline_schema TEXT,
-			webhook_secret TEXT,
 			created_at DATETIME NOT NULL
 		);`,
 		`CREATE TABLE IF NOT EXISTS credentials (
@@ -78,40 +84,65 @@ func (db *DB) migrate() error {
 	}
 
 	for _, q := range queries {
-		if _, err := db.db.Exec(q); err != nil {
-			return err
+		if _, err := db.conn.Exec(q); err != nil {
+			return fmt.Errorf("create table: %w", err)
+		}
+	}
+
+	// Older databases stored the webhook secret per instance in plain text.
+	var hasSecretColumn int
+	if err := db.conn.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('connector_instances') WHERE name = 'webhook_secret';`).Scan(&hasSecretColumn); err != nil {
+		return fmt.Errorf("inspect connector_instances: %w", err)
+	}
+	if hasSecretColumn > 0 {
+		if _, err := db.conn.Exec(`UPDATE connector_instances SET webhook_secret = NULL;`); err != nil {
+			return fmt.Errorf("clear stored webhook secrets: %w", err)
 		}
 	}
 	return nil
 }
 
-func getEncryptionKey() []byte {
+// encryptionKeyFromEnv exits in production when the key is missing or malformed, because a
+// weak key would leave credentials readable; development falls back to a fixed key.
+func encryptionKeyFromEnv() []byte {
 	keyStr := os.Getenv("CONDUIT_ENCRYPTION_KEY")
 	isProd := os.Getenv("CONDUIT_ENV") == "production"
 
 	if keyStr == "" {
 		if isProd {
-			log.Fatalf("FATAL: CONDUIT_ENCRYPTION_KEY environment variable is not set in production!")
-		} else {
-			log.Println("WARNING: CONDUIT_ENCRYPTION_KEY is not set. Falling back to default development key.")
-			keyStr = "dev_encryption_key_32_bytes_long"
+			slog.Error("CONDUIT_ENCRYPTION_KEY is not set in production", "component", "db")
+			os.Exit(1)
 		}
+		slog.Warn("CONDUIT_ENCRYPTION_KEY is not set, using the development key", "component", "db")
+		keyStr = "dev_encryption_key_32_bytes_long"
 	}
 
-	key := []byte(keyStr)
-	if len(key) != 32 {
-		if isProd {
-			log.Fatalf("FATAL: CONDUIT_ENCRYPTION_KEY must be exactly 32 bytes, got %d bytes", len(key))
-		} else {
-			log.Printf("WARNING: CONDUIT_ENCRYPTION_KEY is %d bytes, padding/truncating to 32 bytes for development.", len(key))
-			padded := make([]byte, 32)
-			copy(padded, key)
-			key = padded
-		}
+	if key, ok := parseEncryptionKey(keyStr); ok {
+		return key
 	}
-	return key
+	if isProd {
+		slog.Error("CONDUIT_ENCRYPTION_KEY must be base64 of 32 bytes or exactly 32 characters", "component", "db", "length", len(keyStr))
+		os.Exit(1)
+	}
+	slog.Warn("CONDUIT_ENCRYPTION_KEY is not a valid 32-byte key, padding or truncating it for development", "component", "db", "length", len(keyStr))
+	padded := make([]byte, 32)
+	copy(padded, keyStr)
+	return padded
 }
 
+// parseEncryptionKey accepts base64 of 32 bytes (`openssl rand -base64 32`) or a raw
+// 32-byte string; they cannot be confused, since 32 base64 characters decode to 24 bytes.
+func parseEncryptionKey(s string) ([]byte, bool) {
+	if key, err := base64.StdEncoding.DecodeString(s); err == nil && len(key) == 32 {
+		return key, true
+	}
+	if len(s) == 32 {
+		return []byte(s), true
+	}
+	return nil, false
+}
+
+// encrypt returns base64(nonce||ciphertext) using a fresh nonce per call.
 func (db *DB) encrypt(plaintext string) (string, error) {
 	if plaintext == "" {
 		return "", nil
@@ -160,105 +191,186 @@ func (db *DB) decrypt(ciphertextStr string) (string, error) {
 	return string(plaintext), nil
 }
 
-// Instance CRUD Operations
-
-func (db *DB) SaveInstance(inst *ConnectorInstance) error {
-	query := `INSERT INTO connector_instances (id, connector_id, status, baseline_schema, webhook_secret, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			status = excluded.status,
-			baseline_schema = excluded.baseline_schema,
-			webhook_secret = excluded.webhook_secret;`
-	
-	_, err := db.db.Exec(query, inst.ID, inst.ConnectorID, inst.Status, inst.BaselineSchema, inst.WebhookSecret, inst.CreatedAt)
-	return err
+// execer is satisfied by both *sql.DB and *sql.Tx, so writes can run in a transaction.
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
 }
 
-func (db *DB) GetInstance(id string) (*ConnectorInstance, error) {
-	query := `SELECT id, connector_id, status, baseline_schema, webhook_secret, created_at FROM connector_instances WHERE id = ?;`
-	row := db.db.QueryRow(query, id)
+// CreateInstance stores a new instance and its credentials in one transaction, so a
+// failed credentials write never leaves a half-installed instance behind.
+func (db *DB) CreateInstance(inst *ConnectorInstance, authType sdk.AuthType, creds *sdk.Credentials) error {
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("create instance %s: %w", inst.ID, err)
+	}
+	defer tx.Rollback()
+
+	if err := saveInstance(tx, inst); err != nil {
+		return err
+	}
+	if err := db.insertCredentials(tx, inst.ID, authType, creds); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("create instance %s: %w", inst.ID, err)
+	}
+	return nil
+}
+
+func saveInstance(ex execer, inst *ConnectorInstance) error {
+	query := `INSERT INTO connector_instances (id, connector_id, status, baseline_schema, created_at)
+		VALUES (?, ?, ?, ?, ?);`
+	if _, err := ex.Exec(query, inst.ID, inst.ConnectorID, inst.Status, inst.BaselineSchema, inst.CreatedAt); err != nil {
+		return fmt.Errorf("save instance %s: %w", inst.ID, err)
+	}
+	return nil
+}
+
+// SetInstanceStatus updates the status of an existing instance and reports whether it
+// still exists. It never inserts, so a drift scan cannot bring back a deleted instance.
+func (db *DB) SetInstanceStatus(id, status string) (bool, error) {
+	res, err := db.conn.Exec(`UPDATE connector_instances SET status = ? WHERE id = ?;`, status, id)
+	if err != nil {
+		return false, fmt.Errorf("set status of %s: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("set status of %s: %w", id, err)
+	}
+	return n == 1, nil
+}
+
+// Instance returns the instance with the given ID.
+func (db *DB) Instance(id string) (*ConnectorInstance, error) {
+	query := `SELECT id, connector_id, status, baseline_schema, created_at FROM connector_instances WHERE id = ?;`
+	row := db.conn.QueryRow(query, id)
 
 	var inst ConnectorInstance
-	err := row.Scan(&inst.ID, &inst.ConnectorID, &inst.Status, &inst.BaselineSchema, &inst.WebhookSecret, &inst.CreatedAt)
+	err := row.Scan(&inst.ID, &inst.ConnectorID, &inst.Status, &inst.BaselineSchema, &inst.CreatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("instance not found: %s", id)
 		}
-		return nil, err
+		return nil, fmt.Errorf("get instance %s: %w", id, err)
 	}
 	return &inst, nil
 }
 
+// ListInstances returns all instances, newest first.
 func (db *DB) ListInstances() ([]*ConnectorInstance, error) {
-	query := `SELECT id, connector_id, status, baseline_schema, webhook_secret, created_at FROM connector_instances ORDER BY created_at DESC;`
-	rows, err := db.db.Query(query)
+	query := `SELECT id, connector_id, status, baseline_schema, created_at FROM connector_instances ORDER BY created_at DESC;`
+	rows, err := db.conn.Query(query)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list instances: %w", err)
 	}
 	defer rows.Close()
 
 	var list []*ConnectorInstance
 	for rows.Next() {
 		var inst ConnectorInstance
-		if err := rows.Scan(&inst.ID, &inst.ConnectorID, &inst.Status, &inst.BaselineSchema, &inst.WebhookSecret, &inst.CreatedAt); err != nil {
-			return nil, err
+		if err := rows.Scan(&inst.ID, &inst.ConnectorID, &inst.Status, &inst.BaselineSchema, &inst.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan instance: %w", err)
 		}
 		list = append(list, &inst)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list instances: %w", err)
 	}
 	return list, nil
 }
 
+// DeleteInstance removes the instance and its credentials in one transaction. The
+// credentials are deleted explicitly because SQLite ignores ON DELETE CASCADE by default.
 func (db *DB) DeleteInstance(id string) error {
-	query := `DELETE FROM connector_instances WHERE id = ?;`
-	_, err := db.db.Exec(query, id)
-	return err
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return fmt.Errorf("delete instance %s: %w", id, err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM credentials WHERE instance_id = ?;`, id); err != nil {
+		return fmt.Errorf("delete credentials for %s: %w", id, err)
+	}
+	if _, err := tx.Exec(`DELETE FROM connector_instances WHERE id = ?;`, id); err != nil {
+		return fmt.Errorf("delete instance %s: %w", id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("delete instance %s: %w", id, err)
+	}
+	return nil
 }
 
-// Credentials Operations
+// errNoCredentials is returned when credentials are updated for an instance that has
+// none, usually because the instance was deleted.
+var errNoCredentials = errors.New("no stored credentials")
 
-func (db *DB) SaveCredentials(instanceID string, authType sdk.AuthType, creds *sdk.Credentials) error {
-	var encToken, encRefresh, encAPIKey string
-	var err error
-
-	if creds.Token != nil {
-		encToken, err = db.encrypt(creds.Token.AccessToken)
-		if err != nil {
-			return fmt.Errorf("failed to encrypt access token: %w", err)
-		}
-		encRefresh, err = db.encrypt(creds.Token.RefreshToken)
-		if err != nil {
-			return fmt.Errorf("failed to encrypt refresh token: %w", err)
-		}
+// UpdateCredentials replaces the stored credentials of an existing instance. It never
+// inserts, so a token refresh that finishes after a delete cannot store secrets again.
+func (db *DB) UpdateCredentials(instanceID string, authType sdk.AuthType, creds *sdk.Credentials) error {
+	enc, err := db.encryptCredentials(creds)
+	if err != nil {
+		return err
 	}
-
-	if creds.APIKey != "" {
-		encAPIKey, err = db.encrypt(creds.APIKey)
-		if err != nil {
-			return fmt.Errorf("failed to encrypt api key: %w", err)
-		}
+	res, err := db.conn.Exec(`UPDATE credentials SET auth_type = ?, encrypted_access_token = ?,
+		encrypted_refresh_token = ?, token_expiry = ?, encrypted_api_key = ? WHERE instance_id = ?;`,
+		string(authType), enc.token, enc.refresh, enc.expiry, enc.apiKey, instanceID)
+	if err != nil {
+		return fmt.Errorf("update credentials for %s: %w", instanceID, err)
 	}
-
-	var expiryVal interface{}
-	if creds.Token != nil && !creds.Token.Expiry.IsZero() {
-		expiryVal = creds.Token.Expiry
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update credentials for %s: %w", instanceID, err)
 	}
+	if n == 0 {
+		return fmt.Errorf("update credentials for %s: %w", instanceID, errNoCredentials)
+	}
+	return nil
+}
 
+func (db *DB) insertCredentials(ex execer, instanceID string, authType sdk.AuthType, creds *sdk.Credentials) error {
+	enc, err := db.encryptCredentials(creds)
+	if err != nil {
+		return err
+	}
 	query := `INSERT INTO credentials (instance_id, auth_type, encrypted_access_token, encrypted_refresh_token, token_expiry, encrypted_api_key)
-		VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT(instance_id) DO UPDATE SET
-			auth_type = excluded.auth_type,
-			encrypted_access_token = excluded.encrypted_access_token,
-			encrypted_refresh_token = excluded.encrypted_refresh_token,
-			token_expiry = excluded.token_expiry,
-			encrypted_api_key = excluded.encrypted_api_key;`
-
-	_, err = db.db.Exec(query, instanceID, string(authType), encToken, encRefresh, expiryVal, encAPIKey)
-	return err
+		VALUES (?, ?, ?, ?, ?, ?);`
+	if _, err := ex.Exec(query, instanceID, string(authType), enc.token, enc.refresh, enc.expiry, enc.apiKey); err != nil {
+		return fmt.Errorf("save credentials for %s: %w", instanceID, err)
+	}
+	return nil
 }
 
-func (db *DB) GetCredentials(instanceID string) (*sdk.Credentials, sdk.AuthType, error) {
+type encryptedCredentials struct {
+	token, refresh, apiKey string
+	expiry                 any // nil is stored as NULL for tokens without an expiry
+}
+
+func (db *DB) encryptCredentials(creds *sdk.Credentials) (encryptedCredentials, error) {
+	var enc encryptedCredentials
+	var err error
+	if creds.Token != nil {
+		if enc.token, err = db.encrypt(creds.Token.AccessToken); err != nil {
+			return enc, fmt.Errorf("failed to encrypt access token: %w", err)
+		}
+		if enc.refresh, err = db.encrypt(creds.Token.RefreshToken); err != nil {
+			return enc, fmt.Errorf("failed to encrypt refresh token: %w", err)
+		}
+		if !creds.Token.Expiry.IsZero() {
+			enc.expiry = creds.Token.Expiry
+		}
+	}
+	if creds.APIKey != "" {
+		if enc.apiKey, err = db.encrypt(creds.APIKey); err != nil {
+			return enc, fmt.Errorf("failed to encrypt api key: %w", err)
+		}
+	}
+	return enc, nil
+}
+
+// Credentials returns the decrypted credentials and the auth type they were stored with.
+func (db *DB) Credentials(instanceID string) (*sdk.Credentials, sdk.AuthType, error) {
 	query := `SELECT auth_type, encrypted_access_token, encrypted_refresh_token, token_expiry, encrypted_api_key FROM credentials WHERE instance_id = ?;`
-	row := db.db.QueryRow(query, instanceID)
+	row := db.conn.QueryRow(query, instanceID)
 
 	var authTypeStr string
 	var encToken, encRefresh, encAPIKey sql.NullString
@@ -269,7 +381,7 @@ func (db *DB) GetCredentials(instanceID string) (*sdk.Credentials, sdk.AuthType,
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, "", fmt.Errorf("credentials not found for instance: %s", instanceID)
 		}
-		return nil, "", err
+		return nil, "", fmt.Errorf("get credentials for %s: %w", instanceID, err)
 	}
 
 	authType := sdk.AuthType(authTypeStr)

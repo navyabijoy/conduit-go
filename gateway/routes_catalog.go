@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -16,8 +16,7 @@ import (
 	"conduit/sdk"
 )
 
-// List of available connector definitions for catalog
-func (g *Gateway) handleListConnectors(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleListConnectors(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		writeJSONError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
@@ -32,7 +31,7 @@ func (g *Gateway) handleListConnectors(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var items []CatalogItem
-	for _, conn := range g.registry {
+	for _, conn := range s.registry {
 		meta := conn.Metadata()
 		items = append(items, CatalogItem{
 			ID:          meta.ID,
@@ -47,14 +46,14 @@ func (g *Gateway) handleListConnectors(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(items)
 }
 
-// Install flow: Redirects to OAuth or takes API Key
-func (g *Gateway) handleInstallConnector(w http.ResponseWriter, r *http.Request) {
+// handleInstallConnector serves POST /v1/connectors/{id}/install. OAuth2 connectors get the
+// authorize URL and are created in handleOAuthCallback; API-key ones are created at once.
+func (s *Server) handleInstallConnector(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		writeJSONError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
 
-	// URL shape: /v1/connectors/{connector_id}/install
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/v1/connectors/"), "/")
 	if len(parts) < 2 || parts[1] != "install" {
 		writeJSONError(w, http.StatusBadRequest, "Invalid installation path")
@@ -62,7 +61,7 @@ func (g *Gateway) handleInstallConnector(w http.ResponseWriter, r *http.Request)
 	}
 
 	connectorID := parts[0]
-	conn, ok := g.registry[connectorID]
+	conn, ok := s.registry[connectorID]
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "Connector not found")
 		return
@@ -70,15 +69,18 @@ func (g *Gateway) handleInstallConnector(w http.ResponseWriter, r *http.Request)
 
 	authCfg := conn.AuthConfig()
 	if authCfg.Type == sdk.AuthTypeOAuth2 {
-		// Start OAuth redirection
+		// state ties the callback to this install and guards against CSRF.
 		stateBytes := make([]byte, 16)
 		rand.Read(stateBytes)
 		state := hex.EncodeToString(stateBytes)
 
-		g.pendingOAuthMu.Lock()
-		g.pendingOAuth[state] = connectorID
-		g.pendingOAuthMu.Unlock()
+		if !s.rememberOAuthState(state, connectorID) {
+			writeJSONError(w, http.StatusServiceUnavailable, "Too many installs in progress; try again later")
+			return
+		}
 
+		// TODO: Derive the redirect URI and client ID from configuration; they
+		// are hardcoded for the mock provider and a gateway on :8080.
 		redirectURI := "http://localhost:8080/oauth/callback"
 		authURL, err := url.Parse(authCfg.OAuth2.AuthURL)
 		if err != nil {
@@ -93,7 +95,6 @@ func (g *Gateway) handleInstallConnector(w http.ResponseWriter, r *http.Request)
 		q.Set("scope", strings.Join(authCfg.OAuth2.Scopes, " "))
 		authURL.RawQuery = q.Encode()
 
-		// Return the Auth URL so the client can redirect
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{
 			"type":         "oauth2",
@@ -103,43 +104,17 @@ func (g *Gateway) handleInstallConnector(w http.ResponseWriter, r *http.Request)
 	}
 
 	if authCfg.Type == sdk.AuthTypeAPIKey {
-		// API key install: client POSTs {"api_key":"sk_..."} in the request body
 		var body struct {
 			APIKey string `json:"api_key"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.APIKey == "" {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes)).Decode(&body); err != nil || body.APIKey == "" {
 			writeJSONError(w, http.StatusBadRequest, "api_key is required in request body for API key connectors")
 			return
 		}
 
-		// Create instance
-		instIDBytes := make([]byte, 8)
-		rand.Read(instIDBytes)
-		instanceID := fmt.Sprintf("inst_%s_%s", connectorID, hex.EncodeToString(instIDBytes))
-
-		inst := &ConnectorInstance{
-			ID:            instanceID,
-			ConnectorID:   connectorID,
-			Status:        "active",
-			WebhookSecret: g.webhookSecret,
-			CreatedAt:     time.Now(),
-		}
-
-		creds := &sdk.Credentials{APIKey: body.APIKey}
-		if err := g.db.SaveCredentials(instanceID, sdk.AuthTypeAPIKey, creds); err != nil {
-			writeJSONError(w, http.StatusInternalServerError, "Failed to save credentials")
-			return
-		}
-
-		// Generate baseline schema
-		baselineJSON, err := g.generateBaseline(instanceID, conn, creds)
+		inst, err := s.createInstance(conn, sdk.AuthTypeAPIKey, &sdk.Credentials{APIKey: body.APIKey})
 		if err != nil {
-			log.Printf("WARNING: Failed to generate baseline schema: %v", err)
-		} else {
-			inst.BaselineSchema = baselineJSON
-		}
-
-		if err := g.db.SaveInstance(inst); err != nil {
+			slog.Error("install failed", "component", "gateway", "connector", connectorID, "err", err)
 			writeJSONError(w, http.StatusInternalServerError, "Failed to save connector instance")
 			return
 		}
@@ -147,7 +122,7 @@ func (g *Gateway) handleInstallConnector(w http.ResponseWriter, r *http.Request)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{
 			"type":        "apikey",
-			"instance_id": instanceID,
+			"instance_id": inst.ID,
 			"status":      "active",
 		})
 		return
@@ -156,8 +131,7 @@ func (g *Gateway) handleInstallConnector(w http.ResponseWriter, r *http.Request)
 	writeJSONError(w, http.StatusBadRequest, "Unsupported auth type")
 }
 
-// OAuth Callback handler
-func (g *Gateway) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	code := r.URL.Query().Get("code")
 	state := r.URL.Query().Get("state")
 
@@ -166,26 +140,20 @@ func (g *Gateway) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	g.pendingOAuthMu.Lock()
-	connectorID, ok := g.pendingOAuth[state]
-	if ok {
-		delete(g.pendingOAuth, state)
-	}
-	g.pendingOAuthMu.Unlock()
-
+	connectorID, ok := s.takeOAuthState(state)
 	if !ok {
-		writeJSONError(w, http.StatusBadRequest, "Invalid state token")
+		writeJSONError(w, http.StatusBadRequest, "Invalid or expired state token")
 		return
 	}
 
-	conn := g.registry[connectorID]
+	conn := s.registry[connectorID]
 	authCfg := conn.AuthConfig()
 
-	// Perform Code-to-Token Exchange
 	tokenURL := authCfg.OAuth2.TokenURL
 	client := &http.Client{Timeout: 10 * time.Second}
-	
-	// Create POST parameters
+
+	// TODO: Read client credentials from configuration instead of deriving
+	// them from the connector ID, which only the mock provider accepts.
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", code)
@@ -222,41 +190,13 @@ func (g *Gateway) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		Expiry:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second),
 	}
 
-	// Create Instance ID
-	instIDBytes := make([]byte, 8)
-	rand.Read(instIDBytes)
-	instanceID := fmt.Sprintf("inst_%s_%s", connectorID, hex.EncodeToString(instIDBytes))
-
-	// Save Instance Record
-	inst := &ConnectorInstance{
-		ID:            instanceID,
-		ConnectorID:   connectorID,
-		Status:        "active",
-		WebhookSecret: g.webhookSecret,
-		CreatedAt:     time.Now(),
-	}
-
-	// Save credentials
-	creds := &sdk.Credentials{Token: token}
-	if err := g.db.SaveCredentials(instanceID, sdk.AuthTypeOAuth2, creds); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, "Failed to save credentials")
-		return
-	}
-
-	// Generate baseline schema
-	baselineJSON, err := g.generateBaseline(instanceID, conn, creds)
+	inst, err := s.createInstance(conn, sdk.AuthTypeOAuth2, &sdk.Credentials{Token: token})
 	if err != nil {
-		log.Printf("WARNING: Failed to generate baseline schema: %v", err)
-	} else {
-		inst.BaselineSchema = baselineJSON
-	}
-
-	if err := g.db.SaveInstance(inst); err != nil {
+		slog.Error("install failed", "component", "gateway", "connector", connectorID, "err", err)
 		writeJSONError(w, http.StatusInternalServerError, "Failed to save connector instance")
 		return
 	}
 
-	// Show success page
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	html := fmt.Sprintf(`
 		<!DOCTYPE html>
@@ -282,24 +222,23 @@ func (g *Gateway) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 			</div>
 		</body>
 		</html>
-	`, conn.Metadata().Name, instanceID)
+	`, conn.Metadata().Name, inst.ID)
 	w.Write([]byte(html))
 }
 
-// Lists all installed connector instances
-func (g *Gateway) handleListInstances(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleListInstances(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		writeJSONError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
 
-	list, err := g.db.ListInstances()
+	list, err := s.db.ListInstances()
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "Failed to load instances: "+err.Error())
 		return
 	}
 
-	// Ensure we return empty list [] instead of null JSON if empty
+	// Encode an empty result as [] rather than null so clients can iterate it.
 	if list == nil {
 		list = []*ConnectorInstance{}
 	}
@@ -308,8 +247,8 @@ func (g *Gateway) handleListInstances(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(list)
 }
 
-// Router dispatching GET, DELETE, and execution on /v1/instances/{id}
-func (g *Gateway) handleInstanceRoute(w http.ResponseWriter, r *http.Request) {
+// handleInstanceRoute dispatches GET/DELETE /v1/instances/{id} and POST .../endpoints/{endpoint}.
+func (s *Server) handleInstanceRoute(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/v1/instances/")
 	parts := strings.Split(path, "/")
 
@@ -320,10 +259,8 @@ func (g *Gateway) handleInstanceRoute(w http.ResponseWriter, r *http.Request) {
 
 	instanceID := parts[0]
 
-	// 1. DELETE Instance: /v1/instances/{id}
 	if r.Method == "DELETE" && len(parts) == 1 {
-		err := g.db.DeleteInstance(instanceID)
-		if err != nil {
+		if err := s.db.DeleteInstance(instanceID); err != nil {
 			writeJSONError(w, http.StatusInternalServerError, "Failed to delete instance: "+err.Error())
 			return
 		}
@@ -332,9 +269,8 @@ func (g *Gateway) handleInstanceRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. GET Instance: /v1/instances/{id}
 	if r.Method == "GET" && len(parts) == 1 {
-		inst, err := g.db.GetInstance(instanceID)
+		inst, err := s.db.Instance(instanceID)
 		if err != nil {
 			writeJSONError(w, http.StatusNotFound, "Instance not found: "+err.Error())
 			return
@@ -344,85 +280,96 @@ func (g *Gateway) handleInstanceRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. EXECUTE Endpoint: /v1/instances/{id}/endpoints/{endpoint_name}
 	if r.Method == "POST" && len(parts) >= 3 && parts[1] == "endpoints" {
-		endpointName := parts[2]
-		g.handleExecuteEndpoint(w, r, instanceID, endpointName)
+		s.handleExecuteEndpoint(w, r, instanceID, parts[2])
 		return
 	}
 
 	writeJSONError(w, http.StatusMethodNotAllowed, "Method not allowed")
 }
 
-// generateBaseline executes a test request to capture schema structure upon installation
-func (g *Gateway) generateBaseline(instanceID string, conn sdk.Connector, creds *sdk.Credentials) (string, error) {
-	log.Printf("[Gateway] Capturing baseline schema for instance %s", instanceID)
-	
-	// Create client
+// createInstance captures a baseline for creds, then stores the instance and its credentials.
+func (s *Server) createInstance(conn sdk.Connector, authType sdk.AuthType, creds *sdk.Credentials) (*ConnectorInstance, error) {
+	connectorID := conn.Metadata().ID
+	inst := &ConnectorInstance{
+		ID:          newInstanceID(connectorID),
+		ConnectorID: connectorID,
+		Status:      "active",
+		CreatedAt:   time.Now(),
+	}
+
+	// Without a baseline the instance still works; drift detection just skips it.
+	baselineJSON, err := s.generateBaseline(inst.ID, conn, creds)
+	if err != nil {
+		slog.Warn("baseline capture failed", "component", "gateway", "instance_id", inst.ID, "connector", connectorID, "err", err)
+	} else {
+		inst.BaselineSchema = baselineJSON
+	}
+
+	if err := s.db.CreateInstance(inst, authType, creds); err != nil {
+		return nil, err
+	}
+	return inst, nil
+}
+
+// rememberOAuthState stores a started install and drops abandoned ones. It reports false
+// when maxPendingInstalls are already open, since the API has no auth to stop a flood.
+func (s *Server) rememberOAuthState(state, connectorID string) bool {
+	s.pendingOAuthMu.Lock()
+	defer s.pendingOAuthMu.Unlock()
+
+	for k, p := range s.pendingOAuth {
+		if time.Since(p.started) > oauthStateTTL {
+			delete(s.pendingOAuth, k)
+		}
+	}
+	if len(s.pendingOAuth) >= maxPendingInstalls {
+		return false
+	}
+	s.pendingOAuth[state] = pendingInstall{connectorID: connectorID, started: time.Now()}
+	return true
+}
+
+// takeOAuthState consumes state so it works once; unknown or expired states fail.
+func (s *Server) takeOAuthState(state string) (string, bool) {
+	s.pendingOAuthMu.Lock()
+	p, ok := s.pendingOAuth[state]
+	delete(s.pendingOAuth, state)
+	s.pendingOAuthMu.Unlock()
+
+	if !ok || time.Since(p.started) > oauthStateTTL {
+		return "", false
+	}
+	return p.connectorID, true
+}
+
+func newInstanceID(connectorID string) string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return fmt.Sprintf("inst_%s_%s", connectorID, hex.EncodeToString(b))
+}
+
+// generateBaseline returns the flattened response shape of the connector's probe, as JSON,
+// for later drift comparison.
+func (s *Server) generateBaseline(instanceID string, conn sdk.Connector, creds *sdk.Credentials) (string, error) {
+	connectorID := conn.Metadata().ID
+	slog.Info("capturing baseline schema", "component", "gateway", "instance_id", instanceID, "connector", connectorID)
+
 	client := sdk.NewHTTPClient(
-		"http://"+g.mockHost,
+		"http://"+s.mockHost,
 		*creds,
 		conn.AuthConfig(),
-		g.tokenRefreshHook(instanceID, conn),
+		s.tokenRefreshHook(instanceID, conn),
 	)
-
-	var payload []byte
-	var err error
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if conn.Metadata().ID == "slack" {
-		req := sdk.Request{
-			Body: []byte(`{"channel":"C_BASELINE_GEN","text":"Baseline probe"}`),
-		}
-		var resp sdk.Response
-		resp, err = conn.Endpoints()[0].Execute(ctx, client, req)
-		if err == nil {
-			payload = resp.Body
-		}
-	} else if conn.Metadata().ID == "github" {
-		// Run list_issues request on GitHub mock
-		req := sdk.Request{
-			Params: map[string]string{
-				"owner": "baseline_owner",
-				"repo":  "baseline_repo",
-			},
-		}
-		// list_issues is endpoint index 1
-		var listEP *sdk.EndpointDefinition
-		for _, ep := range conn.Endpoints() {
-			if ep.Name == "list_issues" {
-				listEP = &ep
-				break
-			}
-		}
-		if listEP != nil {
-			var resp sdk.Response
-			resp, err = listEP.Execute(ctx, client, req)
-			if err == nil {
-				payload = resp.Body
-			}
-		}
-	} else if conn.Metadata().ID == "stripe" {
-		req := sdk.Request{Params: map[string]string{"limit": "3"}}
-		for _, ep := range conn.Endpoints() {
-			if ep.Name == "list_charges" {
-				var resp sdk.Response
-				resp, err = ep.Execute(ctx, client, req)
-				if err == nil {
-					payload = resp.Body
-				}
-				break
-			}
-		}
-	}
-
+	payload, err := runProbe(ctx, conn, client, probes[connectorID])
 	if err != nil {
 		return "", fmt.Errorf("baseline request failed: %w", err)
 	}
 
-	// Unmarshal and flatten
 	var obj interface{}
 	if err := json.Unmarshal(payload, &obj); err != nil {
 		return "", fmt.Errorf("failed to unmarshal baseline response: %w", err)
@@ -433,7 +380,7 @@ func (g *Gateway) generateBaseline(instanceID string, conn sdk.Connector, creds 
 
 	schemaBytes, err := json.Marshal(flatSchema)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("marshal baseline schema: %w", err)
 	}
 	return string(schemaBytes), nil
 }

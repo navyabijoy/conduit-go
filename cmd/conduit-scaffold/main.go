@@ -4,17 +4,16 @@
 //
 //	conduit-scaffold -spec <path-or-url> -out <output-dir> [-connector-id <id>]
 //
-// If GEMINI_API_KEY is set, the tool uses the Google Gen AI SDK to produce a
-// richly commented, idiomatic Go connector. Otherwise it falls back to a
-// deterministic template-based generator.
+// With GEMINI_API_KEY set it asks Gemini for the connector; otherwise it renders a template.
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,8 +22,6 @@ import (
 
 	"google.golang.org/genai"
 )
-
-// ─── CLI flags ────────────────────────────────────────────────────────────────
 
 func main() {
 	specPath := flag.String("spec", "", "Path to an OpenAPI 3.x JSON spec file (required)")
@@ -37,50 +34,51 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ── Parse OpenAPI spec ────────────────────────────────────────────────────
 	spec, err := parseOpenAPISpec(*specPath)
 	if err != nil {
-		log.Fatalf("Failed to parse spec: %v", err)
+		fatal("parse spec failed", "path", *specPath, "err", err)
 	}
 
 	if *connID == "" {
 		*connID = toSnakeCase(spec.Info.Title)
 	}
 
-	log.Printf("[Scaffold] Parsed spec: %q — %d paths found", spec.Info.Title, len(spec.Paths))
+	slog.Info("parsed spec", "component", "scaffold", "title", spec.Info.Title, "paths", len(spec.Paths))
 
-	// ── Generate connector ────────────────────────────────────────────────────
 	apiKey := os.Getenv("GEMINI_API_KEY")
 	var code string
 
 	if apiKey != "" {
-		log.Println("[Scaffold] GEMINI_API_KEY found — using AI-assisted generation")
+		slog.Info("GEMINI_API_KEY set, using AI-assisted generation", "component", "scaffold")
 		code, err = generateWithGenAI(apiKey, spec, *connID)
 		if err != nil {
-			log.Printf("[Scaffold] GenAI failed (%v) — falling back to template generator", err)
+			slog.Warn("AI-assisted generation failed, falling back to the template generator", "component", "scaffold", "err", err)
 			code = generateWithTemplate(spec, *connID)
 		}
 	} else {
-		log.Println("[Scaffold] No GEMINI_API_KEY — using template generator")
+		slog.Info("GEMINI_API_KEY not set, using the template generator", "component", "scaffold")
 		code = generateWithTemplate(spec, *connID)
 	}
 
-	// ── Write output ──────────────────────────────────────────────────────────
 	if err := os.MkdirAll(*outDir, 0755); err != nil {
-		log.Fatalf("Failed to create output dir: %v", err)
+		fatal("create output dir failed", "dir", *outDir, "err", err)
 	}
 
 	outFile := filepath.Join(*outDir, *connID+".go")
 	if err := os.WriteFile(outFile, []byte(code), 0644); err != nil {
-		log.Fatalf("Failed to write output file: %v", err)
+		fatal("write output file failed", "path", outFile, "err", err)
 	}
 
-	log.Printf("[Scaffold] ✅ Connector written to %s", outFile)
+	slog.Info("connector written", "component", "scaffold", "path", outFile)
 	fmt.Printf("\nNext steps:\n  1. Move %s into conduit/connectors/%s/\n  2. Implement the Execute function bodies\n  3. Register the connector in gateway/server.go\n\n", outFile, *connID)
 }
 
-// ─── OpenAPI Types ────────────────────────────────────────────────────────────
+func fatal(msg string, args ...any) {
+	slog.Error(msg, append([]any{"component", "scaffold"}, args...)...)
+	os.Exit(1)
+}
 
+// OpenAPISpec is the subset of an OpenAPI 3 document the scaffolder reads.
 type OpenAPISpec struct {
 	OpenAPI string          `json:"openapi"`
 	Info    OpenAPIInfo     `json:"info"`
@@ -98,7 +96,7 @@ type OpenAPIServer struct {
 	URL string `json:"url"`
 }
 
-// OpenAPIPaths is path → methods → operation
+// OpenAPIPaths maps path to lowercase HTTP method to operation.
 type OpenAPIPaths map[string]map[string]OpenAPIOperation
 
 type OpenAPIOperation struct {
@@ -106,7 +104,7 @@ type OpenAPIOperation struct {
 	Summary     string                 `json:"summary"`
 	Description string                 `json:"description"`
 	Parameters  []OpenAPIParam         `json:"parameters"`
-	RequestBody *OpenAPIRequestBody     `json:"requestBody"`
+	RequestBody *OpenAPIRequestBody    `json:"requestBody"`
 	Responses   map[string]interface{} `json:"responses"`
 }
 
@@ -120,8 +118,7 @@ type OpenAPIRequestBody struct {
 	Required bool `json:"required"`
 }
 
-// ─── Parsed endpoint summary (used by both generators) ───────────────────────
-
+// EndpointSummary is one operation flattened for the code generators.
 type EndpointSummary struct {
 	Name        string
 	Method      string
@@ -144,6 +141,8 @@ func parseOpenAPISpec(path string) (*OpenAPISpec, error) {
 	return &spec, nil
 }
 
+// extractEndpoints flattens spec into one summary per path and method, naming operations
+// without an operationId from method and path. Order is not stable.
 func extractEndpoints(spec *OpenAPISpec) []EndpointSummary {
 	var eps []EndpointSummary
 	for path, methods := range spec.Paths {
@@ -172,8 +171,6 @@ func extractEndpoints(spec *OpenAPISpec) []EndpointSummary {
 	}
 	return eps
 }
-
-// ─── Template Generator ───────────────────────────────────────────────────────
 
 const connectorTemplate = `// Code generated by conduit-scaffold on {{.Timestamp}}.
 // Source: {{.SpecTitle}} {{.SpecVersion}}
@@ -276,6 +273,8 @@ type templateEndpoint struct {
 	FuncName string
 }
 
+// generateWithTemplate renders a compilable skeleton; its Execute functions send no body
+// and return the raw response.
 func generateWithTemplate(spec *OpenAPISpec, connID string) string {
 	eps := extractEndpoints(spec)
 
@@ -301,18 +300,18 @@ func generateWithTemplate(spec *OpenAPISpec, connID string) string {
 
 	tmpl, err := template.New("connector").Parse(connectorTemplate)
 	if err != nil {
-		log.Fatalf("template parse error: %v", err)
+		fatal("parse template failed", "err", err)
 	}
 
 	var sb strings.Builder
 	if err := tmpl.Execute(&sb, data); err != nil {
-		log.Fatalf("template execute error: %v", err)
+		fatal("execute template failed", "err", err)
 	}
 	return sb.String()
 }
 
-// ─── GenAI Generator ──────────────────────────────────────────────────────────
-
+// generateWithGenAI asks Gemini to write the connector from the endpoint summaries; the
+// output is not compiled or validated.
 func generateWithGenAI(apiKey string, spec *OpenAPISpec, connID string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -325,7 +324,7 @@ func generateWithGenAI(apiKey string, spec *OpenAPISpec, connID string) (string,
 		return "", fmt.Errorf("create genai client: %w", err)
 	}
 
-	// Summarise the spec for the prompt (avoid blowing the context window)
+	// Only a one-line summary per endpoint goes in the prompt so large specs fit the context window.
 	eps := extractEndpoints(spec)
 	var epLines []string
 	for _, ep := range eps {
@@ -371,7 +370,7 @@ Generate the complete connector now:`,
 	}
 
 	if result == nil || len(result.Candidates) == 0 {
-		return "", fmt.Errorf("empty response from GenAI")
+		return "", errors.New("empty response from GenAI")
 	}
 
 	raw := result.Text()
@@ -382,10 +381,9 @@ Generate the complete connector now:`,
 	return strings.TrimSpace(raw) + "\n", nil
 }
 
-// ─── String utilities ─────────────────────────────────────────────────────────
-
+// toSnakeCase converts a title like "Pet Store" to pet_store: separators become underscores
+// and each capital starts a new word.
 func toSnakeCase(s string) string {
-	// Replace spaces and hyphens with underscores, lowercase everything
 	s = strings.ReplaceAll(s, " ", "_")
 	s = strings.ReplaceAll(s, "-", "_")
 	s = strings.ReplaceAll(s, "/", "_")
@@ -401,13 +399,13 @@ func toSnakeCase(s string) string {
 		}
 	}
 	out := string(result)
-	// Collapse consecutive underscores
 	for strings.Contains(out, "__") {
 		out = strings.ReplaceAll(out, "__", "_")
 	}
 	return strings.Trim(out, "_")
 }
 
+// toPascalCase joins the words of s (split on _ - space and /), capitalizing each.
 func toPascalCase(s string) string {
 	parts := strings.FieldsFunc(s, func(r rune) bool {
 		return r == '_' || r == '-' || r == ' ' || r == '/'
