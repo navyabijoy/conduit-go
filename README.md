@@ -112,12 +112,12 @@ Nothing is required for the local demo. For a real deployment, copy `.env.exampl
 
 | Variable | Purpose |
 |---|---|
-| `CONDUIT_ENV` | Set to `production` to require an encryption key at startup |
-| `CONDUIT_ENCRYPTION_KEY` | Exactly 32 bytes; encrypts stored credentials. Development mode uses a built-in key, so set your own for real data. |
-| `CONDUIT_WEBHOOK_SECRET` | Shared HMAC secret for webhook signatures |
+| `CONDUIT_ENV` | Set to `production` to require an encryption key and webhook secret at startup |
+| `CONDUIT_ENCRYPTION_KEY` | Base64 of 32 random bytes (`openssl rand -base64 32`), or a raw 32-character string; encrypts stored credentials. Development mode uses a built-in key, so set your own for real data. |
+| `CONDUIT_WEBHOOK_SECRET` | Shared HMAC secret for webhook signatures. Required in production; the built-in default is public. |
 | `CONDUIT_ALERT_WEBHOOK_URL` | Optional URL that receives drift alerts |
 
-Flags on `cmd/gateway`: `-addr` (default `:8080`), `-db` (default `./conduit.db`), `-mock` (default `true`), `-mock-addr` (default `:8081`), `-webhook-secret`.
+Flags on `cmd/gateway`: `-addr` (default `:8080`), `-db` (default `./conduit.db`), `-mock-addr` (default `:8081`; the mock provider always runs), `-webhook-secret`.
 
 ## Adding a connector
 
