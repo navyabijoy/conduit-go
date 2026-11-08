@@ -12,7 +12,8 @@ import (
 	"time"
 )
 
-// HTTPClient wraps http.Client to handle credentials, retries, and rate limits.
+// HTTPClient sends connector requests with credentials, OAuth2 refresh, jittered
+// retries and rate-limit handling.
 type HTTPClient struct {
 	client           *http.Client
 	baseURL          string
@@ -24,7 +25,8 @@ type HTTPClient struct {
 	maxBackoff       time.Duration
 }
 
-// NewHTTPClient creates a configured HTTPClient.
+// NewHTTPClient resolves path-only URLs against baseURL. Defaults: 30s timeout,
+// 5 retries, 100ms to 10s backoff. A nil tokenRefreshHook disables token refresh.
 func NewHTTPClient(
 	baseURL string,
 	creds Credentials,
@@ -43,65 +45,53 @@ func NewHTTPClient(
 	}
 }
 
-// SetMaxRetries overrides the default maximum retry count.
+// SetMaxRetries sets how many retries follow the first attempt.
 func (c *HTTPClient) SetMaxRetries(r int) {
 	c.maxRetries = r
 }
 
-// SetBackoffRange overrides the backoff configuration.
+// SetBackoffRange sets the first retry delay and the cap it doubles up to.
 func (c *HTTPClient) SetBackoffRange(base, max time.Duration) {
 	c.baseBackoff = base
 	c.maxBackoff = max
 }
 
-// Credentials returns the current credentials.
+// Credentials returns the current credentials, including a token refreshed during Do.
 func (c *HTTPClient) Credentials() Credentials {
 	return c.creds
 }
 
-// Do executes an HTTP request, applying credentials, retries, and rate-limit handling.
+// maxRateLimitWait caps provider-requested waits so a request never hangs for minutes.
+const maxRateLimitWait = 15 * time.Second
+
+// Do sends req, retrying network errors and 5xx with backoff and waiting out rate limits.
+// A 4xx response is closed and reported as a permanent error carrying the status code.
 func (c *HTTPClient) Do(req *http.Request) (*http.Response, error) {
 	ctx := req.Context()
 
-	// Clone the request because we will modify it (headers) and potentially retry it.
-	cloneRequest := func(r *http.Request, body []byte) *http.Request {
-		rClone := r.Clone(r.Context())
-		if len(body) > 0 {
-			rClone.Body = io.NopCloser(bytes.NewReader(body))
-		}
-		return rClone
-	}
-
-	// Read body so we can re-send it on retries
-	var bodyBytes []byte
+	// Buffered so every attempt can replay it.
+	var body []byte
 	if req.Body != nil {
 		var err error
-		bodyBytes, err = io.ReadAll(req.Body)
+		body, err = io.ReadAll(req.Body)
 		if err != nil {
 			return nil, NewPermanentError("failed to read request body", 0, err)
 		}
 	}
 
-	hasRefreshed := false
-
+	refreshed := false
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
-		// 1. Apply credentials / Refresh if expired
-		if c.authConfig.Type == AuthTypeOAuth2 && c.creds.Token != nil {
-			if c.creds.Token.IsExpired() && c.tokenRefreshHook != nil && !hasRefreshed {
-				newToken, err := c.tokenRefreshHook(ctx, c.creds.Token)
-				if err != nil {
-					return nil, NewPermanentError("failed to refresh token pre-emptively", 0, err)
-				}
-				c.creds.Token = newToken
-				hasRefreshed = true
+		if !refreshed && c.tokenExpired() {
+			if err := c.refreshToken(ctx); err != nil {
+				return nil, NewPermanentError("failed to refresh token pre-emptively", 0, err)
 			}
+			refreshed = true
 		}
 
-		currentReq := cloneRequest(req, bodyBytes)
-		c.applyAuth(currentReq)
+		attemptReq := cloneRequest(req, body)
+		c.applyAuth(attemptReq)
 
-		// 2. Perform Request
-		resp, err := c.client.Do(currentReq)
+		resp, err := c.client.Do(attemptReq)
 		if err != nil {
 			if attempt == c.maxRetries {
 				return nil, NewTransientError("request failed after retries", 0, err)
@@ -113,56 +103,29 @@ func (c *HTTPClient) Do(req *http.Request) (*http.Response, error) {
 			return nil, NewPermanentError("network request failed permanently", 0, err)
 		}
 
-		// 3. Handle Token Refresh on 401 Unauthorized
-		if resp.StatusCode == http.StatusUnauthorized && c.authConfig.Type == AuthTypeOAuth2 && c.tokenRefreshHook != nil && !hasRefreshed {
+		if resp.StatusCode == http.StatusUnauthorized && !refreshed && c.canRefresh() {
 			resp.Body.Close()
-			newToken, err := c.tokenRefreshHook(ctx, c.creds.Token)
-			if err != nil {
+			if err := c.refreshToken(ctx); err != nil {
 				return nil, NewPermanentError("failed to refresh token on 401", http.StatusUnauthorized, err)
 			}
-			c.creds.Token = newToken
-			hasRefreshed = true
-			attempt-- // Redo the attempt with the new token
+			refreshed = true
+			// A retry after a refresh does not count against maxRetries.
+			attempt--
 			continue
 		}
 
-		// 4. Handle Rate Limiting
-		var rateLimitSleep time.Duration
-		isRateLimited := false
-
-		// Slack format: 429 status code with Retry-After header
-		if resp.StatusCode == http.StatusTooManyRequests {
-			isRateLimited = true
-			if retryAfterHeader := resp.Header.Get("Retry-After"); retryAfterHeader != "" {
-				rateLimitSleep = parseRetryAfter(retryAfterHeader)
-			}
-		}
-
-		// GitHub format: 403/429 status code with X-RateLimit-Remaining: 0 and X-RateLimit-Reset
-		if resp.Header.Get("X-RateLimit-Remaining") == "0" {
-			isRateLimited = true
-			if resetHeader := resp.Header.Get("X-RateLimit-Reset"); resetHeader != "" {
-				rateLimitSleep = parseRateLimitReset(resetHeader)
-			}
-		}
-
-		if isRateLimited {
+		if wait, limited := rateLimitWait(resp); limited {
 			resp.Body.Close()
 			if attempt == c.maxRetries {
 				return nil, NewTransientError("rate limit exceeded, maximum retries reached", resp.StatusCode, nil)
 			}
-			// Cap sleep duration to avoid hanging requests indefinitely
-			if rateLimitSleep > 15*time.Second {
-				return nil, NewTransientError(fmt.Sprintf("rate limit exceeded, wait time %s too long", rateLimitSleep), resp.StatusCode, nil)
+			if wait > maxRateLimitWait {
+				return nil, NewTransientError(fmt.Sprintf("rate limit exceeded, wait time %s too long", wait), resp.StatusCode, nil)
 			}
-			if rateLimitSleep == 0 {
-				rateLimitSleep = c.calculateBackoff(attempt)
-			}
-			c.sleep(ctx, attempt, rateLimitSleep)
+			c.sleep(ctx, attempt, wait)
 			continue
 		}
 
-		// 5. Handle Other HTTP Codes
 		if resp.StatusCode >= 500 {
 			resp.Body.Close()
 			if attempt == c.maxRetries {
@@ -172,9 +135,9 @@ func (c *HTTPClient) Do(req *http.Request) (*http.Response, error) {
 			continue
 		}
 
-		// Success or client-side permanent error (4xx besides rate limit / auth)
 		if resp.StatusCode >= 400 {
-			return resp, NewPermanentError(fmt.Sprintf("request failed with status %d", resp.StatusCode), resp.StatusCode, nil)
+			resp.Body.Close()
+			return nil, NewPermanentError(fmt.Sprintf("request failed with status %d", resp.StatusCode), resp.StatusCode, nil)
 		}
 
 		return resp, nil
@@ -183,29 +146,64 @@ func (c *HTTPClient) Do(req *http.Request) (*http.Response, error) {
 	return nil, NewTransientError("request failed, max retries reached", 0, nil)
 }
 
-func (c *HTTPClient) applyAuth(req *http.Request) {
-	// Set target full URL if URL is path-only
-	if req.URL.Scheme == "" && c.baseURL != "" {
-		baseURL := c.baseURL
-		scheme := "http"
-		host := baseURL
+// cloneRequest gives each attempt a fresh body reader; the original can be read once.
+func cloneRequest(r *http.Request, body []byte) *http.Request {
+	clone := r.Clone(r.Context())
+	if len(body) > 0 {
+		clone.Body = io.NopCloser(bytes.NewReader(body))
+	}
+	return clone
+}
 
-		if strings.HasPrefix(baseURL, "http://") {
-			scheme = "http"
-			host = baseURL[7:]
-		} else if strings.HasPrefix(baseURL, "https://") {
-			scheme = "https"
-			host = baseURL[8:]
+func (c *HTTPClient) canRefresh() bool {
+	return c.authConfig.Type == AuthTypeOAuth2 && c.tokenRefreshHook != nil
+}
+
+func (c *HTTPClient) tokenExpired() bool {
+	return c.canRefresh() && c.creds.Token != nil && c.creds.Token.IsExpired()
+}
+
+func (c *HTTPClient) refreshToken(ctx context.Context) error {
+	token, err := c.tokenRefreshHook(ctx, c.creds.Token)
+	if err != nil {
+		return err
+	}
+	c.creds.Token = token
+	return nil
+}
+
+// rateLimitWait reads provider signals: Retry-After on 429 (Slack, Stripe), or GitHub's
+// X-RateLimit-Reset when the quota is spent, which wins if both are present.
+func rateLimitWait(resp *http.Response) (time.Duration, bool) {
+	var wait time.Duration
+	limited := false
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		limited = true
+		if h := resp.Header.Get("Retry-After"); h != "" {
+			wait = parseRetryAfter(h)
 		}
+	}
+	if resp.Header.Get("X-RateLimit-Remaining") == "0" {
+		limited = true
+		if h := resp.Header.Get("X-RateLimit-Reset"); h != "" {
+			wait = parseRateLimitReset(h)
+		}
+	}
+	return wait, limited
+}
 
+// applyAuth points path-only requests at baseURL and sets the auth header.
+func (c *HTTPClient) applyAuth(req *http.Request) {
+	if req.URL.Scheme == "" && c.baseURL != "" {
+		scheme, host := "http", c.baseURL
+		if rest, ok := strings.CutPrefix(c.baseURL, "http://"); ok {
+			host = rest
+		} else if rest, ok := strings.CutPrefix(c.baseURL, "https://"); ok {
+			scheme, host = "https", rest
+		}
 		req.URL.Scheme = scheme
 		req.URL.Host = host
-	}
-
-	// Make sure Host matches base host
-	if req.URL.Host == "" {
-		// Just parse baseURL
-		// For simplicity, let's ensure we do this properly
 	}
 
 	switch c.authConfig.Type {
@@ -215,26 +213,32 @@ func (c *HTTPClient) applyAuth(req *http.Request) {
 		}
 	case AuthTypeAPIKey:
 		if c.authConfig.APIKey != nil && c.creds.APIKey != "" {
-			name := c.authConfig.APIKey.HeaderName
-			prefix := c.authConfig.APIKey.ValuePrefix
-			req.Header.Set(name, prefix+c.creds.APIKey)
+			req.Header.Set(c.authConfig.APIKey.HeaderName, c.authConfig.APIKey.ValuePrefix+c.creds.APIKey)
 		}
 	}
 }
 
+// calculateBackoff doubles per attempt up to maxBackoff, plus up to 50% jitter so
+// clients that failed together do not retry in lockstep.
 func (c *HTTPClient) calculateBackoff(attempt int) time.Duration {
-	// Exponential backoff = baseBackoff * 2^attempt
-	backoff := c.baseBackoff * time.Duration(1<<attempt)
-	if backoff > c.maxBackoff {
-		backoff = c.maxBackoff
+	// Doubling in a loop that stops at the cap cannot overflow, unlike 1<<attempt.
+	backoff := c.baseBackoff
+	for i := 0; i < attempt && backoff < c.maxBackoff; i++ {
+		backoff *= 2
 	}
-	// Add jitter (up to 50% random addition)
-	jitter := time.Duration(rand.Int63n(int64(backoff / 2)))
-	return backoff + jitter
+	backoff = min(backoff, c.maxBackoff)
+	if backoff <= 0 {
+		return 0
+	}
+	if half := int64(backoff / 2); half > 0 {
+		backoff += time.Duration(rand.Int63n(half))
+	}
+	return backoff
 }
 
-func (c *HTTPClient) sleep(ctx context.Context, attempt int, forceDuration time.Duration) {
-	duration := forceDuration
+// sleep waits d, or the backoff for attempt when d is zero, and returns early if ctx is done.
+func (c *HTTPClient) sleep(ctx context.Context, attempt int, d time.Duration) {
+	duration := d
 	if duration == 0 {
 		duration = c.calculateBackoff(attempt)
 	}
@@ -244,6 +248,7 @@ func (c *HTTPClient) sleep(ctx context.Context, attempt int, forceDuration time.
 	}
 }
 
+// parseRetryAfter accepts seconds or an HTTP date, the two forms RFC 9110 allows.
 func parseRetryAfter(h string) time.Duration {
 	if secs, err := strconv.Atoi(h); err == nil {
 		return time.Duration(secs) * time.Second
@@ -258,6 +263,7 @@ func parseRetryAfter(h string) time.Duration {
 	return 0
 }
 
+// parseRateLimitReset turns GitHub's Unix-timestamp reset header into a wait.
 func parseRateLimitReset(h string) time.Duration {
 	if epoch, err := strconv.ParseInt(h, 10, 64); err == nil {
 		t := time.Unix(epoch, 0)

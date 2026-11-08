@@ -6,7 +6,7 @@ import (
 	"syscall"
 )
 
-// ErrorType classifies Conduit execution errors.
+// ErrorType says whether retrying can help.
 type ErrorType string
 
 const (
@@ -14,11 +14,12 @@ const (
 	ErrorTypePermanent ErrorType = "permanent"
 )
 
-// ConduitError represents a structured framework error.
+// ConduitError is the error HTTPClient and connectors return; the gateway labels
+// error metrics with Type.
 type ConduitError struct {
 	Type    ErrorType
 	Message string
-	Code    int // Optional HTTP status code
+	Code    int // HTTP status code, or 0 if the error did not come from a response
 	Err     error
 }
 
@@ -33,17 +34,18 @@ func (e *ConduitError) Unwrap() error {
 	return e.Err
 }
 
-// NewTransientError creates a transient (retryable) error.
+// NewTransientError returns a retryable error.
 func NewTransientError(msg string, code int, err error) error {
 	return &ConduitError{Type: ErrorTypeTransient, Message: msg, Code: code, Err: err}
 }
 
-// NewPermanentError creates a permanent (non-retryable) error.
+// NewPermanentError returns an error that retrying cannot fix.
 func NewPermanentError(msg string, code int, err error) error {
 	return &ConduitError{Type: ErrorTypePermanent, Message: msg, Code: code, Err: err}
 }
 
-// IsTransient checks if the error is classified as transient.
+// IsTransient reports whether err is worth retrying: a transient ConduitError,
+// a timeout, or a dropped connection.
 func IsTransient(err error) bool {
 	if err == nil {
 		return false
@@ -52,18 +54,14 @@ func IsTransient(err error) bool {
 	if errors.As(err, &ce) {
 		return ce.Type == ErrorTypeTransient
 	}
-	// Check standard net/sys errors
 	var netErr net.Error
 	if errors.As(err, &netErr) {
 		return netErr.Timeout()
 	}
-	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.EPIPE) {
-		return true
-	}
-	return false
+	return errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.EPIPE)
 }
 
-// IsPermanent checks if the error is classified as permanent.
+// IsPermanent reports whether err is non-nil and not transient.
 func IsPermanent(err error) bool {
 	if err == nil {
 		return false

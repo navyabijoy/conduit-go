@@ -11,11 +11,6 @@ import (
 
 func TestOffsetPaginator(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Dummy handler
-	}))
-	defer ts.Close()
-
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		offsetStr := r.URL.Query().Get("offset")
 		limitStr := r.URL.Query().Get("limit")
 		offset, _ := strconv.Atoi(offsetStr)
@@ -25,7 +20,7 @@ func TestOffsetPaginator(t *testing.T) {
 			t.Errorf("expected limit to be 2, got %d", limit)
 		}
 
-		// Mock items: total 5 items
+		// The collection holds 5 items, so limit 2 yields pages of 2, 2 and 1.
 		var items []int
 		for i := offset; i < offset+limit && i < 5; i++ {
 			items = append(items, i)
@@ -34,8 +29,8 @@ func TestOffsetPaginator(t *testing.T) {
 		respBytes, _ := json.Marshal(items)
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(respBytes)
-	})
-	ts.Config.Handler = handler
+	}))
+	defer ts.Close()
 
 	client := NewHTTPClient(ts.URL, Credentials{}, AuthConfig{}, nil)
 	paginator := NewOffsetPaginator(ts.URL, 2, "offset", "limit")

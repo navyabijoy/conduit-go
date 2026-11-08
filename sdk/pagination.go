@@ -3,6 +3,7 @@ package sdk
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,13 +11,13 @@ import (
 	"strconv"
 )
 
-// Paginator is the interface for iterating through paginated resources.
+// Paginator walks a list endpoint page by page: call Next while HasNext is true.
 type Paginator interface {
 	HasNext() bool
 	Next(ctx context.Context, client *HTTPClient) ([]byte, error)
 }
 
-// OffsetPaginator handles offset-based paging.
+// OffsetPaginator pages with offset and limit query parameters.
 type OffsetPaginator struct {
 	Path        string
 	Limit       int
@@ -24,31 +25,28 @@ type OffsetPaginator struct {
 	LimitParam  string
 	offset      int
 	hasMore     bool
-	isFirst     bool
 }
 
-// NewOffsetPaginator creates an offset-based paginator.
+// NewOffsetPaginator returns a paginator starting at offset 0.
 func NewOffsetPaginator(path string, limit int, offsetParam, limitParam string) *OffsetPaginator {
 	return &OffsetPaginator{
 		Path:        path,
 		Limit:       limit,
 		OffsetParam: offsetParam,
 		LimitParam:  limitParam,
-		offset:      0,
 		hasMore:     true,
-		isFirst:     true,
 	}
 }
 
-// HasNext returns true if there are potentially more pages.
+// HasNext reports whether another page may exist.
 func (p *OffsetPaginator) HasNext() bool {
 	return p.hasMore
 }
 
-// Next fetches the next page of results.
+// Next fetches the page at the current offset and advances past it.
 func (p *OffsetPaginator) Next(ctx context.Context, client *HTTPClient) ([]byte, error) {
 	if !p.hasMore {
-		return nil, fmt.Errorf("no more pages")
+		return nil, errors.New("no more pages")
 	}
 
 	reqURL, err := url.Parse(p.Path)
@@ -77,7 +75,7 @@ func (p *OffsetPaginator) Next(ctx context.Context, client *HTTPClient) ([]byte,
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
-	// Try to determine if there are more items by checking the number of returned items.
+	// Offset APIs rarely report a total, so a page shorter than Limit is taken as the last.
 	var list []interface{}
 	if err := json.Unmarshal(body, &list); err == nil {
 		p.offset += len(list)
@@ -102,11 +100,10 @@ func (p *OffsetPaginator) Next(ctx context.Context, client *HTTPClient) ([]byte,
 		}
 	}
 
-	p.isFirst = false
 	return body, nil
 }
 
-// CursorPaginator handles cursor-based paging.
+// CursorPaginator pages with an opaque cursor that extractNext reads from each response.
 type CursorPaginator struct {
 	Path        string
 	CursorParam string
@@ -118,7 +115,8 @@ type CursorPaginator struct {
 	extractNext func(body []byte, respHeaders http.Header) (string, bool, error)
 }
 
-// NewCursorPaginator creates a cursor-based paginator.
+// NewCursorPaginator returns a paginator whose first request has no cursor;
+// limitParam may be empty.
 func NewCursorPaginator(
 	path string,
 	cursorParam string,
@@ -131,22 +129,21 @@ func NewCursorPaginator(
 		CursorParam: cursorParam,
 		LimitParam:  limitParam,
 		Limit:       limit,
-		nextCursor:  "",
 		hasMore:     true,
 		isFirst:     true,
 		extractNext: extractNext,
 	}
 }
 
-// HasNext returns true if there are potentially more pages.
+// HasNext reports whether another page may exist.
 func (p *CursorPaginator) HasNext() bool {
 	return p.hasMore
 }
 
-// Next fetches the next page of results.
+// Next fetches the page at the current cursor and stores the cursor for the next.
 func (p *CursorPaginator) Next(ctx context.Context, client *HTTPClient) ([]byte, error) {
 	if !p.hasMore {
-		return nil, fmt.Errorf("no more pages")
+		return nil, errors.New("no more pages")
 	}
 
 	reqURL, err := url.Parse(p.Path)
