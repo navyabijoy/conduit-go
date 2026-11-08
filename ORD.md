@@ -57,7 +57,7 @@ Conduit centralizes these so a new connector only declares its auth, endpoints, 
 
 ## 5. Non-Functional Requirements
 
-- **Security**: Credentials are encrypted at rest. With `CONDUIT_ENV=production`, startup fails unless `CONDUIT_ENCRYPTION_KEY` is exactly 32 bytes.
+- **Security**: Credentials are encrypted at rest. With `CONDUIT_ENV=production`, startup fails unless `CONDUIT_ENCRYPTION_KEY` is base64 of 32 bytes or a raw 32-character string, and unless `CONDUIT_WEBHOOK_SECRET` is set.
 - **Resilience**: Outbound calls respect provider rate limits and back off on transient errors. Execution is bounded by a 30-second timeout and webhook handling by a 10-second timeout.
 - **Operability**: The service is a single static binary with an embedded SQLite file (pure-Go driver, no CGO), shipped as a distroless Docker image.
 - **Observability**: Request latency, request errors, token refreshes, webhook failures, and drift detections are exported as Prometheus metrics.
