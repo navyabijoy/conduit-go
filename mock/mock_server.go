@@ -1,3 +1,5 @@
+// Package mock stands in for the Slack, GitHub and Stripe APIs so the gateway runs without
+// credentials. Its /mock/* endpoints toggle schema drift and rate limiting.
 package mock
 
 import (
@@ -6,53 +8,54 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	stdhtml "html"
 	"io"
-	"log"
+	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-type MockServer struct {
-	addr             string
-	mu               sync.RWMutex
-	driftSlack       bool
-	driftGitHub      bool
-	driftStripe      bool
-	rateLimitSlack   bool
-	rateLimitGitHub  bool
-	rateLimitStripe  bool
-	webhookSecret    string
+// Server is the mock provider; drift and rate limiting are toggled through
+// /mock/toggle-drift and /mock/toggle-rate-limit.
+type Server struct {
+	addr            string
+	mu              sync.RWMutex
+	driftSlack      bool
+	driftGitHub     bool
+	driftStripe     bool
+	rateLimitSlack  bool
+	rateLimitGitHub bool
+	rateLimitStripe bool
+	webhookSecret   string
 }
 
-func NewMockServer(addr string, webhookSecret string) *MockServer {
-	return &MockServer{
+// NewServer returns a mock provider listening on addr that signs webhooks with
+// webhookSecret.
+func NewServer(addr string, webhookSecret string) *Server {
+	return &Server{
 		addr:          addr,
 		webhookSecret: webhookSecret,
 	}
 }
 
-func (s *MockServer) Handler() http.Handler {
+// Handler returns the mock's routes; tests mount it on an httptest.Server.
+func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// OAuth Endpoints
 	mux.HandleFunc("/mock/oauth/authorize", s.handleAuthorize)
 	mux.HandleFunc("/services/slack/oauth/token", s.handleSlackToken)
 	mux.HandleFunc("/services/github/login/oauth/access_token", s.handleGitHubToken)
-
-	// Slack Mock API
 	mux.HandleFunc("/services/slack/chat.postMessage", s.handleSlackPostMessage)
-
-	// GitHub Mock API
 	mux.HandleFunc("/services/github/repos/", s.handleGitHubIssues)
-
-	// Stripe Mock API
 	mux.HandleFunc("/services/stripe/v1/charges", s.handleStripeListCharges)
 
-	// Debug/Simulation Endpoints
 	mux.HandleFunc("/mock/toggle-drift", s.handleToggleDrift)
 	mux.HandleFunc("/mock/toggle-rate-limit", s.handleToggleRateLimit)
 	mux.HandleFunc("/mock/trigger-webhook", s.handleTriggerWebhook)
@@ -60,27 +63,40 @@ func (s *MockServer) Handler() http.Handler {
 	return mux
 }
 
-func (s *MockServer) Start() {
-	server := &http.Server{
-		Addr:    s.addr,
-		Handler: s.Handler(),
+// Start binds the address before returning, so the port is open for callers, then serves
+// in the background.
+func (s *Server) Start() error {
+	ln, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", s.addr, err)
 	}
 
-	log.Printf("[Mock Server] Starting on %s", s.addr)
+	server := &http.Server{
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	slog.Info("mock provider starting", "component", "mock", "addr", s.addr)
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("[Mock Server] Failed: %v", err)
+		if err := server.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("mock provider stopped serving", "component", "mock", "err", err)
 		}
 	}()
+	return nil
 }
 
-func (s *MockServer) handleAuthorize(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	redirectURI := r.URL.Query().Get("redirect_uri")
 	state := r.URL.Query().Get("state")
 	scopes := r.URL.Query().Get("scope")
 	clientID := r.URL.Query().Get("client_id")
 
-	// Render a simple HTML page to simulate consent
+	// Escaping alone would not stop "javascript:" links, so only http(s) targets are allowed.
+	if u, err := url.Parse(redirectURI); err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		http.Error(w, "redirect_uri must be an http or https URL", http.StatusBadRequest)
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	html := fmt.Sprintf(`
 		<!DOCTYPE html>
@@ -106,11 +122,12 @@ func (s *MockServer) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 			</div>
 		</body>
 		</html>
-	`, clientID, scopes, redirectURI, state)
+	`, stdhtml.EscapeString(clientID), stdhtml.EscapeString(scopes),
+		stdhtml.EscapeString(redirectURI), url.QueryEscape(state))
 	w.Write([]byte(html))
 }
 
-func (s *MockServer) handleSlackToken(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSlackToken(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	resp := map[string]interface{}{
 		"access_token":  "mock_slack_access_token_" + strconv.FormatInt(time.Now().Unix(), 10),
@@ -121,7 +138,7 @@ func (s *MockServer) handleSlackToken(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-func (s *MockServer) handleGitHubToken(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGitHubToken(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	resp := map[string]interface{}{
 		"access_token":  "mock_github_access_token_" + strconv.FormatInt(time.Now().Unix(), 10),
@@ -131,7 +148,7 @@ func (s *MockServer) handleGitHubToken(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-func (s *MockServer) handleSlackPostMessage(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSlackPostMessage(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	rateLimit := s.rateLimitSlack
 	drift := s.driftSlack
@@ -169,7 +186,6 @@ func (s *MockServer) handleSlackPostMessage(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Normal Slack response
 	resp := map[string]interface{}{
 		"ok":      true,
 		"channel": reqBody["channel"],
@@ -183,7 +199,7 @@ func (s *MockServer) handleSlackPostMessage(w http.ResponseWriter, r *http.Reque
 	json.NewEncoder(w).Encode(resp)
 }
 
-func (s *MockServer) handleGitHubIssues(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleGitHubIssues(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	rateLimit := s.rateLimitGitHub
 	drift := s.driftGitHub
@@ -205,11 +221,8 @@ func (s *MockServer) handleGitHubIssues(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Path: /services/github/repos/{owner}/{repo}/issues
 	parts := strings.Split(r.URL.Path, "/")
-	// Expected paths:
-	// POST /services/github/repos/{owner}/{repo}/issues (create issue)
-	// GET /services/github/repos/{owner}/{repo}/issues (list issues)
-	
 	isList := r.Method == "GET" && len(parts) >= 7 && parts[6] == "issues"
 	isCreate := r.Method == "POST" && len(parts) >= 7 && parts[6] == "issues"
 
@@ -268,7 +281,6 @@ func (s *MockServer) handleGitHubIssues(w http.ResponseWriter, r *http.Request) 
 		}
 
 		if cursor == "" || cursor == "page1" {
-			// Return link header for page 2
 			w.Header().Set("Link", `</services/github/repos/owner/repo/issues?cursor=page2>; rel="next"`)
 			resp := []map[string]interface{}{
 				{"id": 1, "number": 1, "title": "First Issue", "state": "open"},
@@ -277,7 +289,7 @@ func (s *MockServer) handleGitHubIssues(w http.ResponseWriter, r *http.Request) 
 			json.NewEncoder(w).Encode(resp)
 			return
 		}
-		
+
 		resp := []map[string]interface{}{
 			{"id": 3, "number": 3, "title": "Third Issue", "state": "closed"},
 		}
@@ -288,9 +300,7 @@ func (s *MockServer) handleGitHubIssues(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusNotFound)
 }
 
-// handleStripeListCharges implements GET /services/stripe/v1/charges
-// Stripe uses API key auth (Authorization: Bearer sk_...) and offset pagination (?starting_after=ch_xxx&limit=N)
-func (s *MockServer) handleStripeListCharges(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleStripeListCharges(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -301,7 +311,6 @@ func (s *MockServer) handleStripeListCharges(w http.ResponseWriter, r *http.Requ
 	drift := s.driftStripe
 	s.mu.RUnlock()
 
-	// API key validation
 	auth := r.Header.Get("Authorization")
 	if !strings.HasPrefix(auth, "Bearer sk_") {
 		w.Header().Set("Content-Type", "application/json")
@@ -338,10 +347,8 @@ func (s *MockServer) handleStripeListCharges(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Normal Stripe paginated response
 	var charges []map[string]interface{}
 	if startingAfter == "" {
-		// First page
 		for i := 1; i <= limit; i++ {
 			charges = append(charges, map[string]interface{}{
 				"id":       fmt.Sprintf("ch_page1_%d", i),
@@ -358,7 +365,6 @@ func (s *MockServer) handleStripeListCharges(w http.ResponseWriter, r *http.Requ
 			"url":      "/services/stripe/v1/charges",
 		})
 	} else {
-		// Second page
 		for i := 1; i <= 2; i++ {
 			charges = append(charges, map[string]interface{}{
 				"id":       fmt.Sprintf("ch_page2_%d", i),
@@ -377,7 +383,7 @@ func (s *MockServer) handleStripeListCharges(w http.ResponseWriter, r *http.Requ
 	}
 }
 
-func (s *MockServer) handleToggleDrift(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleToggleDrift(w http.ResponseWriter, r *http.Request) {
 	connectorID := r.URL.Query().Get("connector_id")
 	driftStr := r.URL.Query().Get("drift")
 	drift, _ := strconv.ParseBool(driftStr)
@@ -385,11 +391,12 @@ func (s *MockServer) handleToggleDrift(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if connectorID == "slack" {
+	switch connectorID {
+	case "slack":
 		s.driftSlack = drift
-	} else if connectorID == "github" {
+	case "github":
 		s.driftGitHub = drift
-	} else if connectorID == "stripe" {
+	case "stripe":
 		s.driftStripe = drift
 	}
 
@@ -397,7 +404,7 @@ func (s *MockServer) handleToggleDrift(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"connector_id":"%s","drift":%v}`, connectorID, drift)
 }
 
-func (s *MockServer) handleToggleRateLimit(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleToggleRateLimit(w http.ResponseWriter, r *http.Request) {
 	connectorID := r.URL.Query().Get("connector_id")
 	rateLimitStr := r.URL.Query().Get("rate_limit")
 	rateLimit, _ := strconv.ParseBool(rateLimitStr)
@@ -405,11 +412,12 @@ func (s *MockServer) handleToggleRateLimit(w http.ResponseWriter, r *http.Reques
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if connectorID == "slack" {
+	switch connectorID {
+	case "slack":
 		s.rateLimitSlack = rateLimit
-	} else if connectorID == "github" {
+	case "github":
 		s.rateLimitGitHub = rateLimit
-	} else if connectorID == "stripe" {
+	case "stripe":
 		s.rateLimitStripe = rateLimit
 	}
 
@@ -417,7 +425,9 @@ func (s *MockServer) handleToggleRateLimit(w http.ResponseWriter, r *http.Reques
 	fmt.Fprintf(w, `{"connector_id":"%s","rate_limit":%v}`, connectorID, rateLimit)
 }
 
-func (s *MockServer) handleTriggerWebhook(w http.ResponseWriter, r *http.Request) {
+// handleTriggerWebhook signs the payload as the named provider would, POSTs it to
+// target_url and returns the response so callers can see whether verification passed.
+func (s *Server) handleTriggerWebhook(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ConnectorID string                 `json:"connector_id"`
 		TargetURL   string                 `json:"target_url"`
@@ -433,7 +443,6 @@ func (s *MockServer) handleTriggerWebhook(w http.ResponseWriter, r *http.Request
 
 	payloadBytes, _ := json.Marshal(req.Payload)
 
-	// Sign payload using hmac-sha256 and s.webhookSecret
 	mac := hmac.New(sha256.New, []byte(s.webhookSecret))
 	mac.Write(payloadBytes)
 	signatureHex := hex.EncodeToString(mac.Sum(nil))
@@ -446,10 +455,11 @@ func (s *MockServer) handleTriggerWebhook(w http.ResponseWriter, r *http.Request
 	}
 
 	webhookReq.Header.Set("Content-Type", "application/json")
-	if req.ConnectorID == "slack" {
+	switch req.ConnectorID {
+	case "slack":
 		webhookReq.Header.Set("X-Slack-Signature", "v0="+signatureHex)
 		webhookReq.Header.Set("X-Slack-Request-Timestamp", strconv.FormatInt(time.Now().Unix(), 10))
-	} else if req.ConnectorID == "github" {
+	case "github":
 		webhookReq.Header.Set("X-Hub-Signature-256", "sha256="+signatureHex)
 	}
 

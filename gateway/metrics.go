@@ -1,8 +1,6 @@
 package gateway
 
-import (
-	"github.com/prometheus/client_golang/prometheus"
-)
+import "github.com/prometheus/client_golang/prometheus"
 
 var (
 	requestDuration = prometheus.NewHistogramVec(
@@ -55,22 +53,26 @@ func init() {
 	prometheus.MustRegister(driftDetections)
 }
 
-func RecordRequestDuration(connectorID, endpoint, status string, durationSeconds float64) {
+// recordRequestDuration observes one endpoint execution; status is "success" or "error".
+func recordRequestDuration(connectorID, endpoint, status string, durationSeconds float64) {
 	requestDuration.WithLabelValues(connectorID, endpoint, status).Observe(durationSeconds)
 }
 
-func RecordRequestError(connectorID, endpoint, errType string) {
+// recordRequestError counts a failed execution; errType is "transient" or "permanent".
+func recordRequestError(connectorID, endpoint, errType string) {
 	requestErrors.WithLabelValues(connectorID, endpoint, errType).Inc()
 }
 
-func RecordTokenRefresh(connectorID, status string) {
+// recordTokenRefresh counts a refresh attempt; status is "success" or "failure".
+func recordTokenRefresh(connectorID, status string) {
 	tokenRefreshes.WithLabelValues(connectorID, status).Inc()
 }
 
-func RecordWebhookFailure(connectorID, reason string) {
+func recordWebhookFailure(connectorID, reason string) {
 	webhookFailures.WithLabelValues(connectorID, reason).Inc()
 }
 
-func RecordDriftDetection(connectorID, status string) {
+// recordDriftDetection counts a completed drift scan; status is "drifted" or "healthy".
+func recordDriftDetection(connectorID, status string) {
 	driftDetections.WithLabelValues(connectorID, status).Inc()
 }

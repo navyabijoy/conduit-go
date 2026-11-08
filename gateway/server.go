@@ -1,11 +1,17 @@
+// Package gateway is Conduit's HTTP server: it installs connector instances, runs their
+// endpoints, receives webhooks and detects schema drift.
 package gateway
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -17,60 +23,74 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-type Gateway struct {
+// Server serves the API, webhooks, docs, metrics and dashboard.
+type Server struct {
 	db             *DB
 	mockHost       string
 	webhookSecret  string
 	registry       map[string]sdk.Connector
-	pendingOAuth   map[string]string // state -> connectorID
+	pendingOAuth   map[string]pendingInstall // OAuth state -> install in progress
 	pendingOAuthMu sync.Mutex
 	driftDetector  *DriftDetector
 }
 
-func NewGateway(db *DB, mockHost string, webhookSecret string) *Gateway {
+// pendingInstall is an OAuth install that was started but not completed.
+type pendingInstall struct {
+	connectorID string
+	started     time.Time
+}
+
+// oauthStateTTL is how long a user has to finish the provider's consent screen.
+const oauthStateTTL = 10 * time.Minute
+
+// maxPendingInstalls caps unfinished OAuth installs held in memory.
+const maxPendingInstalls = 1000
+
+// maxBodyBytes caps request bodies so one large upload cannot exhaust memory. It
+// matches GitHub's 25 MB webhook payload limit, the largest a provider sends.
+const maxBodyBytes = 25 << 20
+
+// New returns a Server with Slack, GitHub and Stripe registered. mockHost is the host:port
+// connector requests go to; webhookSecret verifies inbound webhooks.
+func New(db *DB, mockHost string, webhookSecret string) *Server {
 	registry := map[string]sdk.Connector{
-		"slack":  slack.NewSlackConnector(mockHost),
-		"github": github.NewGitHubConnector(mockHost),
-		"stripe": stripe.NewStripeConnector(mockHost),
+		"slack":  slack.New(mockHost),
+		"github": github.New(mockHost),
+		"stripe": stripe.New(),
 	}
 
-	g := &Gateway{
+	s := &Server{
 		db:            db,
 		mockHost:      mockHost,
 		webhookSecret: webhookSecret,
 		registry:      registry,
-		pendingOAuth:  make(map[string]string),
+		pendingOAuth:  make(map[string]pendingInstall),
 	}
 
-	g.driftDetector = NewDriftDetector(db, registry, webhookSecret, mockHost)
-	return g
+	s.driftDetector = NewDriftDetector(db, registry, mockHost)
+	return s
 }
 
-func (g *Gateway) Start(addr string) {
+// Handler returns the gateway's routes; tests mount it on an httptest.Server.
+func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// Catalog & OAuth Install Routes
-	mux.HandleFunc("/v1/connectors", g.handleListConnectors)
-	mux.HandleFunc("/v1/connectors/", g.handleInstallConnector) // matches /v1/connectors/{id}/install
-	mux.HandleFunc("/oauth/callback", g.handleOAuthCallback)
+	mux.HandleFunc("/v1/connectors", s.handleListConnectors)
+	mux.HandleFunc("/v1/connectors/", s.handleInstallConnector) // POST /v1/connectors/{id}/install
+	mux.HandleFunc("/oauth/callback", s.handleOAuthCallback)
 
-	// Instances Management
-	mux.HandleFunc("/v1/instances", g.handleListInstances)
-	mux.HandleFunc("/v1/instances/", g.handleInstanceRoute) // matches GET /v1/instances/{id}, DELETE /v1/instances/{id}, or POST /v1/instances/{id}/endpoints/{endpoint}
+	mux.HandleFunc("/v1/instances", s.handleListInstances)
+	// GET and DELETE /v1/instances/{id}, POST /v1/instances/{id}/endpoints/{endpoint}
+	mux.HandleFunc("/v1/instances/", s.handleInstanceRoute)
 
-	// Global Webhook Receiver
-	mux.HandleFunc("/webhooks/", g.handleWebhookPayload)
+	mux.HandleFunc("/webhooks/", s.handleWebhookPayload)
 
-	// OpenAPI and Metrics
-	mux.HandleFunc("/openapi.json", g.handleOpenAPISpec)
-	mux.HandleFunc("/docs", g.handleDocs)
-	mux.HandleFunc("/docs/", g.handleDocs)
+	mux.HandleFunc("/openapi.json", s.handleOpenAPISpec)
+	mux.HandleFunc("/docs", s.handleDocs)
+	mux.HandleFunc("/docs/", s.handleDocs)
 	mux.Handle("/metrics", promhttp.Handler())
 
-	// UI Dashboard — serves static files from ./ui/
 	mux.Handle("/ui/", http.StripPrefix("/ui/", http.FileServer(http.Dir("./ui"))))
-
-	// Root redirect to /ui/
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
 			http.Redirect(w, r, "/ui/", http.StatusFound)
@@ -79,55 +99,68 @@ func (g *Gateway) Start(addr string) {
 		http.NotFound(w, r)
 	})
 
-	// Start Drift Detector background worker
-	g.driftDetector.Start(30 * time.Second)
-
-	log.Printf("[Gateway] Starting API Gateway on %s", addr)
-	server := &http.Server{
-		Addr:    addr,
-		Handler: g.loggingMiddleware(mux),
-	}
-
-	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("[Gateway] Failed: %v", err)
-		}
-	}()
+	return logRequests(mux)
 }
 
-func (g *Gateway) loggingMiddleware(next http.Handler) http.Handler {
+// Start binds addr before returning, so the port is open for callers, then serves in the
+// background and starts the drift detector.
+func (s *Server) Start(addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", addr, err)
+	}
+
+	s.driftDetector.Start(30 * time.Second)
+
+	slog.Info("gateway starting", "component", "gateway", "addr", addr)
+	server := &http.Server{
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		if err := server.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("gateway stopped serving", "component", "gateway", "err", err)
+		}
+	}()
+	return nil
+}
+
+func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
-		log.Printf("[Gateway] %s %s - %v", r.Method, r.URL.Path, time.Since(start))
+		slog.Info("request", "component", "gateway", "method", r.Method, "path", r.URL.Path, "duration", time.Since(start))
 	})
 }
 
-// tokenRefreshHook handles renewing OAuth tokens.
-func (g *Gateway) tokenRefreshHook(instanceID string, conn sdk.Connector) func(ctx context.Context, token *sdk.Token) (*sdk.Token, error) {
+// tokenRefreshHook returns an instance's refresh hook; it persists the new token so later
+// requests and drift scans use it.
+func (s *Server) tokenRefreshHook(instanceID string, conn sdk.Connector) func(ctx context.Context, token *sdk.Token) (*sdk.Token, error) {
+	connectorID := conn.Metadata().ID
 	return func(ctx context.Context, oldToken *sdk.Token) (*sdk.Token, error) {
-		log.Printf("[Gateway] Refreshing OAuth token for instance %s", instanceID)
-		
+		slog.Info("refreshing oauth token", "component", "gateway", "instance_id", instanceID, "connector", connectorID)
+
 		authCfg := conn.AuthConfig()
 		if authCfg.Type != sdk.AuthTypeOAuth2 || authCfg.OAuth2 == nil {
 			return nil, fmt.Errorf("connector does not support OAuth2")
 		}
 
-		// Prepare refresh request
-		// Since it's a mock/local service, we can post refresh parameters
+		// TODO: A real provider also needs the client ID and secret here; the
+		// mock provider accepts the refresh token alone.
+		form := url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {oldToken.RefreshToken},
+		}
 		client := &http.Client{Timeout: 10 * time.Second}
-		
-		// In a real OAuth server, we would send client ID / secret / refresh_token
-		// We'll simulate this token trade with our mock token URL
-		resp, err := client.Post(authCfg.OAuth2.TokenURL+"?grant_type=refresh_token&refresh_token="+oldToken.RefreshToken, "application/json", nil)
+		resp, err := client.PostForm(authCfg.OAuth2.TokenURL, form)
 		if err != nil {
-			RecordTokenRefresh(conn.Metadata().ID, "failure")
+			recordTokenRefresh(connectorID, "failure")
 			return nil, fmt.Errorf("failed to call refresh URL: %w", err)
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			RecordTokenRefresh(conn.Metadata().ID, "failure")
+			recordTokenRefresh(connectorID, "failure")
 			return nil, fmt.Errorf("refresh server returned code %d", resp.StatusCode)
 		}
 
@@ -137,7 +170,7 @@ func (g *Gateway) tokenRefreshHook(instanceID string, conn sdk.Connector) func(c
 			ExpiresIn    int    `json:"expires_in"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-			RecordTokenRefresh(conn.Metadata().ID, "failure")
+			recordTokenRefresh(connectorID, "failure")
 			return nil, fmt.Errorf("failed to parse refresh response: %w", err)
 		}
 
@@ -147,20 +180,32 @@ func (g *Gateway) tokenRefreshHook(instanceID string, conn sdk.Connector) func(c
 			Expiry:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second),
 		}
 
-		// Encrypt and save back to DB
 		creds := &sdk.Credentials{Token: newToken}
-		if err := g.db.SaveCredentials(instanceID, sdk.AuthTypeOAuth2, creds); err != nil {
-			RecordTokenRefresh(conn.Metadata().ID, "failure")
+		if err := s.db.UpdateCredentials(instanceID, sdk.AuthTypeOAuth2, creds); err != nil {
+			recordTokenRefresh(connectorID, "failure")
 			return nil, fmt.Errorf("failed to save refreshed credentials: %w", err)
 		}
 
-		RecordTokenRefresh(conn.Metadata().ID, "success")
-		log.Printf("[Gateway] Token refreshed successfully for instance %s", instanceID)
+		recordTokenRefresh(connectorID, "success")
+		slog.Info("oauth token refreshed", "component", "gateway", "instance_id", instanceID, "connector", connectorID)
 		return newToken, nil
 	}
 }
 
-// Helpers for responses
+// readBody reads the request body up to maxBodyBytes. On failure it also returns the
+// status to answer with: 413 for an oversized body, 400 otherwise.
+func readBody(w http.ResponseWriter, r *http.Request) ([]byte, int, error) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			return nil, http.StatusRequestEntityTooLarge, err
+		}
+		return nil, http.StatusBadRequest, err
+	}
+	return body, http.StatusOK, nil
+}
+
 func writeJSONError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)

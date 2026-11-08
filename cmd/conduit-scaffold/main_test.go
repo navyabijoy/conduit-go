@@ -127,7 +127,6 @@ func TestGenerateWithTemplate(t *testing.T) {
 
 	code := generateWithTemplate(spec, "petstore")
 
-	// Verify the generated file contains the expected structure
 	checks := []string{
 		"package petstore",
 		"PetstoreConnector",

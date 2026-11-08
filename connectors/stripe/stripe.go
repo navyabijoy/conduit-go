@@ -1,8 +1,6 @@
-// Package stripe implements a Conduit connector for Stripe.
-//
-// Auth:       API Key (Authorization: Bearer sk_...)
-// Endpoints:  list_charges (offset-paginated via Stripe's cursor-style starting_after)
-// Webhook:    Stripe-Signature HMAC-SHA256 verification
+// Package stripe is the Stripe connector: API-key auth, list_charges paginated by
+// starting_after, and a Stripe-Signature check that matches the mock, not real Stripe
+// (see HandleWebhook).
 package stripe
 
 import (
@@ -17,24 +15,15 @@ import (
 	"conduit/sdk"
 )
 
-// ─── Connector ────────────────────────────────────────────────────────────────
+// Connector is the Stripe connector. API-key auth needs no provider URLs.
+type Connector struct{}
 
-type StripeConnector struct {
-	mockBaseURL string
+// New returns a Stripe connector.
+func New() *Connector {
+	return &Connector{}
 }
 
-// NewStripeConnector returns a Stripe connector pointed at mockBaseURL.
-// In production mockBaseURL is empty and the real Stripe API is used.
-func NewStripeConnector(mockBaseURL string) *StripeConnector {
-	if mockBaseURL == "" {
-		mockBaseURL = "localhost:8081"
-	}
-	return &StripeConnector{mockBaseURL: mockBaseURL}
-}
-
-// ─── Metadata ─────────────────────────────────────────────────────────────────
-
-func (c *StripeConnector) Metadata() sdk.ConnectorMetadata {
+func (c *Connector) Metadata() sdk.ConnectorMetadata {
 	return sdk.ConnectorMetadata{
 		ID:          "stripe",
 		Name:        "Stripe",
@@ -44,9 +33,7 @@ func (c *StripeConnector) Metadata() sdk.ConnectorMetadata {
 	}
 }
 
-// ─── Auth ─────────────────────────────────────────────────────────────────────
-
-func (c *StripeConnector) AuthConfig() sdk.AuthConfig {
+func (c *Connector) AuthConfig() sdk.AuthConfig {
 	return sdk.AuthConfig{
 		Type: sdk.AuthTypeAPIKey,
 		APIKey: &sdk.APIKeyConfig{
@@ -55,8 +42,6 @@ func (c *StripeConnector) AuthConfig() sdk.AuthConfig {
 		},
 	}
 }
-
-// ─── I/O Schemas ──────────────────────────────────────────────────────────────
 
 // Charge represents a Stripe charge object.
 type Charge struct {
@@ -75,25 +60,21 @@ type ChargeList struct {
 	URL     string   `json:"url"`
 }
 
-// ─── Endpoints ────────────────────────────────────────────────────────────────
-
-func (c *StripeConnector) Endpoints() []sdk.EndpointDefinition {
+func (c *Connector) Endpoints() []sdk.EndpointDefinition {
 	return []sdk.EndpointDefinition{
 		{
 			Name:         "list_charges",
 			Method:       "GET",
 			Path:         "/services/stripe/v1/charges",
 			Description:  "List Stripe charges with offset pagination (starting_after cursor).",
-			InputSchema:  nil,
 			OutputSchema: &ChargeList{},
 			Execute:      c.executeListCharges,
-			GetPaginator: c.getPaginatorForListCharges,
+			GetPaginator: c.listChargesPaginator,
 		},
 	}
 }
 
-// executeListCharges fetches a page of charges from Stripe.
-func (c *StripeConnector) executeListCharges(ctx context.Context, client *sdk.HTTPClient, req sdk.Request) (sdk.Response, error) {
+func (c *Connector) executeListCharges(ctx context.Context, client *sdk.HTTPClient, req sdk.Request) (sdk.Response, error) {
 	reqURL, err := url.Parse("/services/stripe/v1/charges")
 	if err != nil {
 		return sdk.Response{}, sdk.NewPermanentError("invalid path", http.StatusInternalServerError, err)
@@ -127,12 +108,10 @@ func (c *StripeConnector) executeListCharges(ctx context.Context, client *sdk.HT
 	return sdk.Response{Body: body, StatusCode: resp.StatusCode}, nil
 }
 
-// getPaginatorForListCharges returns a CursorPaginator that uses Stripe's
-// starting_after cursor field (last item ID from previous page).
-func (c *StripeConnector) getPaginatorForListCharges(path string, params map[string]string, limit int) sdk.Paginator {
-	baseURL := "/services/stripe/v1/charges"
+// listChargesPaginator pages with starting_after, the ID of the previous page's last charge.
+func (c *Connector) listChargesPaginator(path string, params map[string]string, limit int) sdk.Paginator {
 	return sdk.NewCursorPaginator(
-		baseURL,
+		"/services/stripe/v1/charges",
 		"starting_after",
 		"limit",
 		limit,
@@ -140,8 +119,7 @@ func (c *StripeConnector) getPaginatorForListCharges(path string, params map[str
 	)
 }
 
-// extractStripeNextCursor reads has_more and the last item ID from a Stripe list response.
-// Returns the ID of the last charge as the cursor for starting_after.
+// extractStripeNextCursor uses the last charge's ID as the next starting_after cursor.
 func extractStripeNextCursor(body []byte, _ http.Header) (string, bool, error) {
 	var list struct {
 		HasMore bool     `json:"has_more"`
@@ -153,27 +131,21 @@ func extractStripeNextCursor(body []byte, _ http.Header) (string, bool, error) {
 	if !list.HasMore || len(list.Data) == 0 {
 		return "", false, nil
 	}
-	// Stripe cursor = ID of the last item in the current page
-	lastID := list.Data[len(list.Data)-1].ID
-	return lastID, true, nil
+	return list.Data[len(list.Data)-1].ID, true, nil
 }
 
-// ─── Webhook ──────────────────────────────────────────────────────────────────
-
-// HandleWebhook verifies the Stripe-Signature header using HMAC-SHA256.
-// Stripe sends: Stripe-Signature: t=timestamp,v1=hex_sig
-func (c *StripeConnector) HandleWebhook(ctx context.Context, event sdk.WebhookEvent) error {
+// HandleWebhook checks the v1 HMAC-SHA256 of the body in the Stripe-Signature header under
+// event.Secret. Real Stripe signs "{t}.{body}".
+func (c *Connector) HandleWebhook(ctx context.Context, event sdk.WebhookEvent) error {
 	sigHeader := event.Headers["Stripe-Signature"]
 	if sigHeader == "" {
 		return sdk.NewPermanentError("missing Stripe-Signature header", http.StatusBadRequest, nil)
 	}
 
-	// Extract the v1= signature from the comma-separated header
-	// Format: t=1234567890,v1=abcdef...
 	sig := ""
 	for _, part := range strings.Split(sigHeader, ",") {
 		if strings.HasPrefix(part, "v1=") {
-			sig = part // pass the full "v1=hex" string
+			sig = part
 			break
 		}
 	}
@@ -181,8 +153,8 @@ func (c *StripeConnector) HandleWebhook(ctx context.Context, event sdk.WebhookEv
 		return sdk.NewPermanentError("no v1 signature found in Stripe-Signature header", http.StatusBadRequest, nil)
 	}
 
-	secret := []byte("mock_webhook_secret_value")
-	if !sdk.VerifyHMACSHA256HexSignature(event.Payload, sig, "v1=", secret) {
+	// TODO: Verify Stripe's real signed payload "{t}.{body}" and reject stale timestamps.
+	if !sdk.VerifyHMACSHA256HexSignature(event.Payload, sig, "v1=", event.Secret) {
 		return sdk.NewPermanentError("invalid Stripe webhook signature", http.StatusUnauthorized, nil)
 	}
 

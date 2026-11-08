@@ -2,8 +2,7 @@ package gateway
 
 import (
 	"context"
-	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -11,44 +10,42 @@ import (
 	"conduit/sdk"
 )
 
-func (g *Gateway) handleWebhookPayload(w http.ResponseWriter, r *http.Request) {
+// handleWebhookPayload hands the raw body to the connector, which verifies the signature;
+// a failure is a 401.
+func (s *Server) handleWebhookPayload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		writeJSONError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		return
 	}
 
-	// URL shape: /webhooks/{instance_id}
 	instanceID := strings.TrimPrefix(r.URL.Path, "/webhooks/")
 	if instanceID == "" || strings.Contains(instanceID, "/") {
 		writeJSONError(w, http.StatusBadRequest, "Invalid instance ID")
 		return
 	}
 
-	// Load instance
-	inst, err := g.db.GetInstance(instanceID)
+	inst, err := s.db.Instance(instanceID)
 	if err != nil {
-		RecordWebhookFailure("unknown", "instance_not_found")
+		recordWebhookFailure("unknown", "instance_not_found")
 		writeJSONError(w, http.StatusNotFound, "Instance not found")
 		return
 	}
 
-	// Resolve connector
-	conn, ok := g.registry[inst.ConnectorID]
+	conn, ok := s.registry[inst.ConnectorID]
 	if !ok {
-		RecordWebhookFailure(inst.ConnectorID, "connector_not_found")
+		recordWebhookFailure(inst.ConnectorID, "connector_not_found")
 		writeJSONError(w, http.StatusInternalServerError, "Connector not registered")
 		return
 	}
 
-	// Read raw body payload
-	payloadBytes, err := io.ReadAll(r.Body)
+	// The body must reach the connector byte for byte; re-encoding would break the HMAC.
+	payloadBytes, status, err := readBody(w, r)
 	if err != nil {
-		RecordWebhookFailure(inst.ConnectorID, "cannot_read_body")
-		writeJSONError(w, http.StatusBadRequest, "Cannot read request body")
+		recordWebhookFailure(inst.ConnectorID, "cannot_read_body")
+		writeJSONError(w, status, "Cannot read request body")
 		return
 	}
 
-	// Copy headers
 	headers := make(map[string]string)
 	for k, v := range r.Header {
 		if len(v) > 0 {
@@ -56,34 +53,32 @@ func (g *Gateway) handleWebhookPayload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Build WebhookEvent
 	event := sdk.WebhookEvent{
-		Payload:   payloadBytes,
-		Headers:   headers,
-		EventType: "webhook", // Can parse more granularly per provider if needed
+		Payload: payloadBytes,
+		Headers: headers,
+		Secret:  []byte(s.webhookSecret),
+		// TODO: Parse the provider's event type instead of a fixed value.
+		EventType: "webhook",
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Handle Webhook (this verifies HMAC signature inside the connector code!)
-	err = conn.HandleWebhook(ctx, event)
-	if err != nil {
-		log.Printf("[Gateway] Webhook verification failed for instance %s: %v", instanceID, err)
-		
+	if err := conn.HandleWebhook(ctx, event); err != nil {
+		slog.Warn("webhook verification failed", "component", "gateway", "instance_id", instanceID, "connector", inst.ConnectorID, "err", err)
+
 		reason := "verification_failed"
 		if strings.Contains(err.Error(), "signature") {
 			reason = "signature_mismatch"
 		}
-		RecordWebhookFailure(inst.ConnectorID, reason)
+		recordWebhookFailure(inst.ConnectorID, reason)
 
 		writeJSONError(w, http.StatusUnauthorized, "Webhook verification failed: "+err.Error())
 		return
 	}
 
-	log.Printf("[Gateway] Webhook delivered successfully for instance %s (%s)", instanceID, inst.ConnectorID)
+	slog.Info("webhook delivered", "component", "gateway", "instance_id", instanceID, "connector", inst.ConnectorID)
 
-	// Return success
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{"status":"received"}`))

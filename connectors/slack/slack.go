@@ -1,3 +1,5 @@
+// Package slack is the Slack connector: OAuth2 install, chat.postMessage, and an
+// X-Slack-Signature check that matches the mock, not real Slack (see HandleWebhook).
 package slack
 
 import (
@@ -11,22 +13,27 @@ import (
 	"conduit/sdk"
 )
 
-type SlackConnector struct {
+// Connector is the Slack connector.
+type Connector struct {
 	mockBaseURL string
 }
 
-func NewSlackConnector(mockBaseURL string) *SlackConnector {
+// New returns a Slack connector; an empty mockBaseURL means the mock provider at
+// localhost:8081.
+func New(mockBaseURL string) *Connector {
 	if mockBaseURL == "" {
 		mockBaseURL = "localhost:8081"
 	}
-	return &SlackConnector{mockBaseURL: mockBaseURL}
+	return &Connector{mockBaseURL: mockBaseURL}
 }
 
+// SendMessageInput is the request body for the send_message endpoint.
 type SendMessageInput struct {
 	Channel string `json:"channel"`
 	Text    string `json:"text"`
 }
 
+// SendMessageOutput is Slack's chat.postMessage response.
 type SendMessageOutput struct {
 	OK      bool   `json:"ok"`
 	Channel string `json:"channel"`
@@ -34,7 +41,7 @@ type SendMessageOutput struct {
 	Error   string `json:"error,omitempty"`
 }
 
-func (c *SlackConnector) Metadata() sdk.ConnectorMetadata {
+func (c *Connector) Metadata() sdk.ConnectorMetadata {
 	return sdk.ConnectorMetadata{
 		ID:          "slack",
 		Name:        "Slack",
@@ -44,7 +51,7 @@ func (c *SlackConnector) Metadata() sdk.ConnectorMetadata {
 	}
 }
 
-func (c *SlackConnector) AuthConfig() sdk.AuthConfig {
+func (c *Connector) AuthConfig() sdk.AuthConfig {
 	return sdk.AuthConfig{
 		Type: sdk.AuthTypeOAuth2,
 		OAuth2: &sdk.OAuth2Config{
@@ -55,7 +62,7 @@ func (c *SlackConnector) AuthConfig() sdk.AuthConfig {
 	}
 }
 
-func (c *SlackConnector) Endpoints() []sdk.EndpointDefinition {
+func (c *Connector) Endpoints() []sdk.EndpointDefinition {
 	return []sdk.EndpointDefinition{
 		{
 			Name:         "send_message",
@@ -69,8 +76,7 @@ func (c *SlackConnector) Endpoints() []sdk.EndpointDefinition {
 	}
 }
 
-func (c *SlackConnector) executeSendMessage(ctx context.Context, client *sdk.HTTPClient, req sdk.Request) (sdk.Response, error) {
-	// Parse input
+func (c *Connector) executeSendMessage(ctx context.Context, client *sdk.HTTPClient, req sdk.Request) (sdk.Response, error) {
 	var input SendMessageInput
 	if err := json.Unmarshal(req.Body, &input); err != nil {
 		return sdk.Response{}, sdk.NewPermanentError("invalid JSON body", http.StatusBadRequest, err)
@@ -80,20 +86,17 @@ func (c *SlackConnector) executeSendMessage(ctx context.Context, client *sdk.HTT
 		return sdk.Response{}, sdk.NewPermanentError("channel and text are required fields", http.StatusBadRequest, nil)
 	}
 
-	// Prepare raw payload
 	payloadBytes, err := json.Marshal(input)
 	if err != nil {
 		return sdk.Response{}, sdk.NewPermanentError("failed to marshal request", http.StatusInternalServerError, err)
 	}
 
-	// Create request
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", "/services/slack/chat.postMessage", strings.NewReader(string(payloadBytes)))
 	if err != nil {
 		return sdk.Response{}, sdk.NewPermanentError("failed to create HTTP request", http.StatusInternalServerError, err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
-	// Execute call
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		return sdk.Response{}, err
@@ -111,22 +114,17 @@ func (c *SlackConnector) executeSendMessage(ctx context.Context, client *sdk.HTT
 	}, nil
 }
 
-func (c *SlackConnector) HandleWebhook(ctx context.Context, event sdk.WebhookEvent) error {
-	// Slack signs webhooks with X-Slack-Signature and uses raw request body
+// HandleWebhook checks "v0=" plus the hex HMAC-SHA256 of the body under event.Secret.
+// Real Slack signs "v0:{timestamp}:{body}".
+func (c *Connector) HandleWebhook(ctx context.Context, event sdk.WebhookEvent) error {
 	sig := event.Headers["X-Slack-Signature"]
 	if sig == "" {
 		return sdk.NewPermanentError("missing Slack signature header", http.StatusBadRequest, nil)
 	}
 
-	// Signatures usually look like v0=hex...
-	// We'll read the webhook secret from context or system environment (simulated here)
-	secret := []byte("mock_webhook_secret_value")
-
-	if !sdk.VerifyHMACSHA256HexSignature(event.Payload, sig, "v0=", secret) {
+	// TODO: Sign Slack's real basestring and reject replays via X-Slack-Request-Timestamp.
+	if !sdk.VerifyHMACSHA256HexSignature(event.Payload, sig, "v0=", event.Secret) {
 		return sdk.NewPermanentError("invalid webhook signature", http.StatusUnauthorized, nil)
 	}
-
-	// Signature matches! Parse the event payload.
-	// (Business logic would process this event, e.g. logging or forwarding. For the SDK we just validate).
 	return nil
 }
